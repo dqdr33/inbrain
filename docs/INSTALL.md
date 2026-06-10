@@ -1,0 +1,113 @@
+# Install
+
+Three install paths. Pick one. Mix later if needed.
+
+## 1. Run with an agent platform (recommended)
+
+Already running [OpenClaw](https://github.com/inbrain-ai/openclaw) or [Hermes](https://github.com/inbrain-ai/hermes)?
+
+```bash
+bun install -g github:inbrain-ai/inbrain
+inbrain init --pglite                  # 2 seconds; no server
+inbrain skillpack scaffold --all       # 43 skills scaffolded into your agent workspace
+inbrain doctor                         # green checks all the way down
+```
+
+Your agent now reads `skills/RESOLVER.md` once per request, routes intent to the right skill, executes. New entity mentions create new pages. Daily cron runs enrichment overnight.
+
+Scaffolded skills are first-class files in your agent repo — edit freely. To pull upstream inbrain improvements later, `inbrain skillpack reference <name>` diffs your local copy vs the bundle. The legacy `skillpack install` managed-block model was retired in v0.36.0.0; if you're upgrading from an older release, run `inbrain skillpack migrate-fence` once to strip the legacy fence and keep your existing skill rows.
+
+To upgrade later: `inbrain upgrade` runs schema migrations + post-upgrade prompts (chunker bumps, the v0.36.2.0 ZeroEntropy switch). Always TTY-only; non-TTY upgrades skip prompts with informational stderr lines.
+
+## 2. CLI standalone
+
+No agent platform, just shell + MCP-aware editor.
+
+```bash
+bun install -g github:inbrain-ai/inbrain
+inbrain init --pglite
+```
+
+> **If `bun install -g` hits a postinstall error** (Bun blocks postinstall hooks in some environments), the CLI prints a recovery hint pointing at [#218](https://github.com/inbrain-ai/inbrain/issues/218). Run `inbrain doctor` to diagnose, then `inbrain apply-migrations --yes` manually. The deterministic fallback is `git clone https://github.com/inbrain-ai/inbrain.git ~/inbrain && cd ~/inbrain && bun install && bun link`.
+
+The init flow detects your repo size and suggests Supabase for brains > 1000 markdown files. To switch later:
+
+```bash
+inbrain migrate --to supabase     # PGLite → Postgres
+inbrain migrate --to pglite       # Postgres → PGLite (rare)
+```
+
+For shared / large / multi-machine deployments (a team or company brain with multiple users hitting one server over HTTP MCP with OAuth scoping per user), follow the dedicated walkthrough: **[Tutorial: set up Inbrain as your company brain](tutorials/company-brain.md)**.
+
+API keys live in `~/.inbrain/config.json` (file plane) or env vars (`OPENAI_API_KEY`, `ZEROENTROPY_API_KEY`, `VOYAGE_API_KEY`, `ANTHROPIC_API_KEY`). Set via CLI:
+
+```bash
+inbrain config set zeroentropy_api_key sk-...
+inbrain config set anthropic_api_key sk-ant-...
+```
+
+Common follow-ups:
+
+```bash
+inbrain import ~/my-knowledge      # bulk-import a markdown folder
+inbrain sync --watch               # live-sync a git repo (autopilot mode)
+inbrain autopilot --install        # background daemon for nightly enrichment
+```
+
+**Wire this same local brain into your coding agent** — zero server, zero token:
+
+```bash
+claude mcp add inbrain -- inbrain serve    # Claude Code
+codex  mcp add inbrain -- inbrain serve    # Codex
+```
+
+The agent spawns `inbrain serve` as a stdio subprocess against your local brain. Full walkthrough (both this local path and connecting to a remote brain), plus the brain-first protocol to paste into `CLAUDE.md` / `AGENTS.md`: **[Give your coding agent a memory](tutorials/connect-coding-agent.md)**.
+
+## 3. MCP server (any MCP client)
+
+```bash
+inbrain serve                      # stdio MCP (Claude Desktop / Code / Cursor)
+inbrain serve --http               # HTTP MCP with OAuth 2.1 + admin dashboard
+```
+
+**Wire a coding agent to a remote brain in one command** (when you have an HTTP
+server + a bearer token): `inbrain connect` prints a paste-ready setup block, or
+`--install` runs it and smoke-tests the token.
+
+```bash
+inbrain auth create "claude-code"
+inbrain connect https://your-host/mcp --token inbrain_xxx                      # Claude Code (default)
+inbrain connect https://your-host/mcp --token inbrain_xxx --agent codex        # Codex (env-var bearer)
+inbrain connect https://your-host/mcp --agent perplexity --oauth --register   # Perplexity (OAuth)
+```
+
+Per-client setup guides live in [`docs/mcp/`](mcp/):
+
+- [`docs/mcp/CLAUDE_CODE.md`](mcp/CLAUDE_CODE.md)
+- [`docs/mcp/CODEX.md`](mcp/CODEX.md)
+- [`docs/mcp/CLAUDE_DESKTOP.md`](mcp/CLAUDE_DESKTOP.md)
+- [`docs/mcp/CHATGPT.md`](mcp/CHATGPT.md)
+- [`docs/mcp/PERPLEXITY.md`](mcp/PERPLEXITY.md)
+- [`docs/mcp/DEPLOY.md`](mcp/DEPLOY.md) — production deploy patterns
+
+The HTTP server ships with an admin SPA at `/admin`, an SSE activity feed at `/admin/events`, DCR-style client registration, scope-gated `read`/`write`/`admin` access, and rate limiting.
+
+## Thin-client mode
+
+Connect to someone else's brain without running a local engine:
+
+```bash
+inbrain init --mcp-only            # configures remote MCP, skips local DB
+```
+
+Useful for: team mounts, brain-as-a-service deployments, dev machines without disk space. Most local commands refuse with a paste-ready hint. See [`docs/architecture/topologies.md`](architecture/topologies.md).
+
+## Verifying the install
+
+```bash
+inbrain doctor --json              # full health check
+inbrain models                     # which AI models are configured for what
+inbrain models doctor              # 1-token probe per configured model
+```
+
+If anything's yellow, `inbrain doctor` names the fix command in the message. Most issues are missing API keys or stale schema (`inbrain upgrade --force-schema`).

@@ -1,0 +1,39 @@
+storage:
+  db_tracked:
+    - people/
+    - companies/
+    - concepts/
+    - ideas/
+    - projects/
+    - predictions/markets/
+    - predictions/meta/
+
+  db_only:
+    - media/x/
+    - media/articles/
+    - meetings/transcripts/
+    - predictions/signals/
+    - predictions/resolutions/
+    - predictions/dreams/
+    - predictions/knowledge/
+
+prediction:
+  signal_sources:
+    - x_twitter
+    - news
+    - onchain
+    - polymarket
+    - kalshi
+
+  quality_threshold: 65
+  auto_resolution: true
+  dream_cycle_cron: "0 3 * * *"
+
+  categories:
+    - crypto
+    - politics
+    - technology
+    - finance
+    - regulation
+    - social
+    - science
