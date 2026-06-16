@@ -231,6 +231,74 @@ async function collectSignals(): Promise<PredictionSignal[]> {
 }
 
 // ---------------------------------------------------------------------
+// Crowd-price extraction (AnalystAgent.discoverAlpha exists in the library
+// but isn't wired into this cycle — this is the lightweight version:
+// extract the crowd's own implied probability from the raw signal so the
+// report can show AI-vs-crowd divergence directly, instead of needing a
+// manual side-by-side lookup after the fact).
+//
+//   - Polymarket: rawData.outcomePrices is a JSON-ENCODED STRING (verified
+//     against the live API 2026-06-16 — gamma-api literally returns
+//     `"outcomePrices":"[\"0.0965\", \"0.9035\"]"`, a string, not an array),
+//     where index 0 is the YES price = the crowd-implied probability.
+//   - Kalshi: rawData.yesAsk is a 0-100 cents value; /100 gives probability.
+// ---------------------------------------------------------------------
+function extractCrowdProbability(signal: PredictionSignal): number | undefined {
+  const raw = signal.rawData;
+  if (!raw) return undefined;
+  if (signal.source === "polymarket" && typeof raw.outcomePrices === "string") {
+    try {
+      const arr = JSON.parse(raw.outcomePrices) as string[];
+      const yes = parseFloat(arr[0]);
+      return Number.isFinite(yes) ? yes : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (signal.source === "kalshi" && typeof raw.yesAsk === "number") {
+    return raw.yesAsk / 100;
+  }
+  return undefined;
+}
+
+// Flag a divergence as worth calling out once it's at least this many
+// percentage points — these markets run small (sub-10% YES is typical for
+// long-shot futures), so even a few points is meaningful, but noise in a
+// single LLM probability call shouldn't read as "found alpha".
+const ALPHA_DIVERGENCE_THRESHOLD_PP = 3;
+
+interface MarketWithCrowd {
+  market: PredictionMarket;
+  crowdProb?: number;
+}
+
+function formatCrowdComparison(items: MarketWithCrowd[]): string[] {
+  const withCrowd = items.filter((i) => i.crowdProb !== undefined);
+  if (withCrowd.length === 0) return [];
+
+  const lines = ["## AI vs Crowd", ""];
+  // Sort by absolute divergence, biggest first — the interesting rows lead.
+  const rows = withCrowd
+    .map(({ market, crowdProb }) => {
+      const aiPct = market.aiEstimate.yesProbability * 100;
+      const crowdPct = crowdProb! * 100;
+      const diffPp = aiPct - crowdPct;
+      return { market, aiPct, crowdPct, diffPp };
+    })
+    .sort((a, b) => Math.abs(b.diffPp) - Math.abs(a.diffPp));
+
+  for (const r of rows) {
+    const sign = r.diffPp >= 0 ? "+" : "";
+    const flag = Math.abs(r.diffPp) >= ALPHA_DIVERGENCE_THRESHOLD_PP ? " ⚠ notable divergence" : "";
+    lines.push(
+      `- ${r.market.title} — AI ${r.aiPct.toFixed(1)}% vs Crowd ${r.crowdPct.toFixed(1)}% (${sign}${r.diffPp.toFixed(1)}pp)${flag}`,
+    );
+  }
+  lines.push("");
+  return lines;
+}
+
+// ---------------------------------------------------------------------
 // Markdown formatting for the brain page (mirrors AnalystAgent's private
 // formatDailyReport shape since that method isn't exported).
 // ---------------------------------------------------------------------
@@ -241,7 +309,10 @@ function asPercent(value: number): number {
   return Math.round(value > 1 ? value : value * 100);
 }
 
-function formatReportMarkdown(report: Awaited<ReturnType<AnalystAgent["generateDailyReport"]>>): string {
+function formatReportMarkdown(
+  report: Awaited<ReturnType<AnalystAgent["generateDailyReport"]>>,
+  marketsWithCrowd: MarketWithCrowd[],
+): string {
   const dateStr = report.date.toISOString().slice(0, 10);
   const lines = [
     "---",
@@ -265,6 +336,7 @@ function formatReportMarkdown(report: Awaited<ReturnType<AnalystAgent["generateD
     }
     lines.push("");
   }
+  lines.push(...formatCrowdComparison(marketsWithCrowd));
   if (report.alphaOpportunities.length) {
     lines.push("## Alpha Opportunities");
     for (const a of report.alphaOpportunities.slice(0, 5)) {
@@ -296,6 +368,15 @@ async function main(): Promise<void> {
   const signals = await collectSignals();
   console.log(`[run-prediction-cycle] collected ${signals.length} signal(s)`);
 
+  // Capture crowd-implied probability per signal BEFORE evaluation (the
+  // BrainAgent doesn't carry rawData through to PredictionMarket, so this
+  // has to be looked up from the original signal afterward).
+  const crowdBySignalId = new Map<string, number>();
+  for (const signal of signals) {
+    const crowd = extractCrowdProbability(signal);
+    if (crowd !== undefined) crowdBySignalId.set(signal.id, crowd);
+  }
+
   const brainAgent = new BrainAgent({
     qualityThreshold: QUALITY_THRESHOLD,
     modelId: GEMINI_MODEL,
@@ -316,9 +397,14 @@ async function main(): Promise<void> {
   }
   console.log(`[run-prediction-cycle] ${markets.length} accepted, ${rejected} rejected`);
 
+  const marketsWithCrowd: MarketWithCrowd[] = markets.map((market) => ({
+    market,
+    crowdProb: crowdBySignalId.get(market.sourceSignals[0] ?? ""),
+  }));
+
   const analyst = new AnalystAgent({ brainQuery, llmCall });
   const report = await analyst.generateDailyReport(markets);
-  const reportMd = formatReportMarkdown(report);
+  const reportMd = formatReportMarkdown(report, marketsWithCrowd);
 
   console.log("\n" + reportMd + "\n");
 
