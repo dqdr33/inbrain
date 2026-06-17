@@ -45,6 +45,7 @@ import { BrainAgent } from "../src/prediction/brain-agent.ts";
 import { AnalystAgent } from "../src/prediction/analyst-agent.ts";
 import type { PredictionSignal, PredictionMarket, SignalSource } from "../src/prediction/types.ts";
 import { loadKeyPool, isKeyExhaustedError } from "./lib/gemini-keys.ts";
+import { sendTelegram } from "./lib/telegram.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 // gemini-2.0-flash / -lite return free-tier limit=0 on this project; 2.5-flash
@@ -378,7 +379,7 @@ async function translateToRussian(englishMd: string): Promise<string> {
   }
 }
 
-async function saveReportFile(reportMd: string, startedAt: Date): Promise<void> {
+async function saveReportFile(reportMd: string, startedAt: Date, ruMd: string): Promise<void> {
   const pad = (n: number) => String(n).padStart(2, "0");
   const y = startedAt.getFullYear();
   const mo = pad(startedAt.getMonth() + 1);
@@ -387,8 +388,6 @@ async function saveReportFile(reportMd: string, startedAt: Date): Promise<void> 
   const mi = pad(startedAt.getMinutes());
   const filename = `${y}-${mo}-${d}_${h}${mi}.md`;
   const filePath = join(REPORT_DIR, filename);
-
-  const ruMd = await translateToRussian(reportMd);
 
   const combined =
     reportMd +
@@ -455,7 +454,12 @@ async function main(): Promise<void> {
 
   console.log("\n" + reportMd + "\n");
 
-  await saveReportFile(reportMd, startedAt);
+  const ruTranslation = await translateToRussian(reportMd);
+  await saveReportFile(reportMd, startedAt, ruTranslation);
+
+  const telegramText = ruTranslation || reportMd;
+  const sent = await sendTelegram(telegramText, { envPath: join(REPO_ROOT, ".env") });
+  if (sent) console.log("[telegram] report sent");
 
   const slug = `predictions/reports/${startedAt.toISOString().slice(0, 10)}-${String(startedAt.getHours()).padStart(2, "0")}${String(startedAt.getMinutes()).padStart(2, "0")}`;
   await brainWrite(slug, reportMd);
