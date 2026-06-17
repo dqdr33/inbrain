@@ -37,6 +37,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { SignalAgent } from "../src/prediction/signal-agent.ts";
@@ -359,6 +360,52 @@ function formatReportMarkdown(
 }
 
 // ---------------------------------------------------------------------
+// Report file output — saves bilingual .md to Report/YYYY-MM-DD_HHMM.md
+// ---------------------------------------------------------------------
+const REPORT_DIR = join(REPO_ROOT, "Report");
+
+async function translateToRussian(englishMd: string): Promise<string> {
+  try {
+    return await llmCall(
+      "You are a professional translator. Translate the following Markdown report from English to Russian. " +
+        "Preserve all Markdown formatting (headers, lists, bold, frontmatter). " +
+        "Translate all text content but keep slugs, numbers, percentages, and YAML keys as-is.",
+      englishMd,
+    );
+  } catch (err) {
+    console.error("[report-file] translation failed (non-fatal):", (err as Error).message.slice(0, 200));
+    return "";
+  }
+}
+
+async function saveReportFile(reportMd: string, startedAt: Date): Promise<void> {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const y = startedAt.getFullYear();
+  const mo = pad(startedAt.getMonth() + 1);
+  const d = pad(startedAt.getDate());
+  const h = pad(startedAt.getHours());
+  const mi = pad(startedAt.getMinutes());
+  const filename = `${y}-${mo}-${d}_${h}${mi}.md`;
+  const filePath = join(REPORT_DIR, filename);
+
+  const ruMd = await translateToRussian(reportMd);
+
+  const combined =
+    reportMd +
+    "\n\n---\n\n" +
+    "# Русский перевод\n\n" +
+    (ruMd || "_Перевод недоступен — квота Gemini исчерпана._");
+
+  try {
+    mkdirSync(REPORT_DIR, { recursive: true });
+    writeFileSync(filePath, combined, "utf-8");
+    console.log(`[report-file] saved → Report/${filename}`);
+  } catch (err) {
+    console.error("[report-file] write failed:", (err as Error).message.slice(0, 200));
+  }
+}
+
+// ---------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------
 async function main(): Promise<void> {
@@ -407,6 +454,8 @@ async function main(): Promise<void> {
   const reportMd = formatReportMarkdown(report, marketsWithCrowd);
 
   console.log("\n" + reportMd + "\n");
+
+  await saveReportFile(reportMd, startedAt);
 
   const slug = `predictions/reports/${startedAt.toISOString().slice(0, 10)}-${String(startedAt.getHours()).padStart(2, "0")}${String(startedAt.getMinutes()).padStart(2, "0")}`;
   await brainWrite(slug, reportMd);

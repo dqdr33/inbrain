@@ -48,4 +48,7 @@ predictions/signals/
 predictions/resolutions/
 predictions/dreams/
 predictions/knowledge/
+
+# Daily prediction reports (local files, not committed)
+Report/
 .github/workflows/
