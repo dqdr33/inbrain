@@ -15,9 +15,29 @@ import type {
   MarketCategory,
   CrowdWisdom,
 } from "./types.js";
+import {
+  parseLlmJson,
+  requireScore,
+  requireProbability,
+  requireIntInRange,
+  optionalStringArray,
+  logValidationFailure,
+  PROBABILITY_SCALE_RULE,
+} from "./llm-json.js";
+import { CALIBRATION_SLUG_QUERY } from "./calibration.js";
+import { extractCrowdProbability } from "./crowd.js";
+import { formatPercent } from "./format.js";
 
 const DEFAULT_QUALITY_THRESHOLD = 65;
 const DEFAULT_MODEL = "anthropic/claude-sonnet-4-6";
+
+/** Sources that are themselves prediction-market venues. Signals from these
+ *  arrive with a resolution rule and deadline already attached. */
+const EXISTING_MARKET_SOURCES = new Set<PredictionSignal["source"]>([
+  "polymarket",
+  "kalshi",
+  "predictit",
+]);
 
 export interface BrainAgentOptions {
   qualityThreshold?: number;
@@ -49,12 +69,30 @@ export class BrainAgent {
     this.lookbackDays = opts.historicalLookbackDays ?? 90;
     this.modelId = opts.modelId ?? DEFAULT_MODEL;
 
-    this.brainQuery =
-      opts.brainQuery ??
-      (async () => "No brain connection configured. Using default analysis.");
+    // Empty string, not a sentence. A non-empty default gets interpolated into
+    // the system prompt as if it were real calibration guidance.
+    this.brainQuery = opts.brainQuery ?? (async () => "");
     this.brainWrite = opts.brainWrite ?? (async () => {});
     this.llmCall =
-      opts.llmCall ?? (async () => "LLM not configured. Cannot evaluate.");
+      opts.llmCall ??
+      (async () => {
+        throw new Error("BrainAgent: no llmCall configured");
+      });
+  }
+
+  /** Calibration rules are the same for every signal in a run, but the old code
+   *  fetched them inside both assessQuality and generateEstimate — two extra
+   *  brain queries per signal, each a fresh CLI process. Fetch once, reuse. */
+  private calibrationCache: Promise<string> | null = null;
+
+  private calibrationRules(): Promise<string> {
+    if (!this.calibrationCache) {
+      this.calibrationCache = this.brainQuery(CALIBRATION_SLUG_QUERY).catch((err) => {
+        console.error(`[brain-agent] calibration lookup failed: ${(err as Error).message}`);
+        return "";
+      });
+    }
+    return this.calibrationCache;
   }
 
   async evaluate(
@@ -67,10 +105,8 @@ export class BrainAgent {
       `[brain-agent] evaluating signal ${signal.id}: "${signal.content.slice(0, 80)}..."`,
     );
 
-    const [historicalContext, crowdWisdom] = await Promise.all([
-      this.queryHistoricalContext(signal),
-      this.queryCrowdWisdom(signal),
-    ]);
+    const historicalContext = await this.queryHistoricalContext(signal);
+    const crowdWisdom = this.crowdWisdomFor(signal);
 
     const qualityScore = await this.assessQuality(
       signal,
@@ -99,7 +135,7 @@ export class BrainAgent {
     await this.recordToMemory(signal, market, qualityScore);
 
     console.log(
-      `[brain-agent] accepted signal ${signal.id} → market "${market.title}" (quality: ${qualityScore.overall}, YES: ${Math.round(estimate.yesProbability * 100)}%)`,
+      `[brain-agent] accepted signal ${signal.id} → market "${market.title}" (quality: ${qualityScore.overall}, YES: ${formatPercent(estimate.yesProbability)})`,
     );
 
     return { accepted: true, market };
@@ -115,22 +151,33 @@ from the last ${this.lookbackDays} days. Focus on verifiable events with clear o
     return this.brainQuery(query);
   }
 
-  private async queryCrowdWisdom(
-    signal: PredictionSignal,
-  ): Promise<CrowdWisdom[]> {
-    const query = `Find crowd consensus data from Polymarket, Kalshi, and PredictIt 
-for events related to: "${signal.content}". Include probability estimates, volume, 
-and participant counts.`;
+  /**
+   * Crowd consensus for this signal.
+   *
+   * This used to issue a brain query asking a semantic search engine to return
+   * a JSON array — it never did, so the parse always failed and every
+   * evaluation was handed an empty array at the cost of one CLI process per
+   * signal. The signal itself already carries the exchange's own numbers, so
+   * read them instead of asking for them.
+   */
+  private crowdWisdomFor(signal: PredictionSignal): CrowdWisdom[] {
+    const probability = extractCrowdProbability(signal);
+    if (probability === undefined) return [];
 
-    const raw = await this.brainQuery(query);
+    const raw = signal.rawData ?? {};
+    const volume = Number(raw.volume24hr ?? raw.volume ?? 0);
 
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed as CrowdWisdom[];
-    } catch {
-      // Brain returned prose — that's fine, crowd wisdom is optional
-    }
-    return [];
+    return [
+      {
+        platform: signal.source,
+        marketId: signal.id,
+        question: signal.content.slice(0, 200),
+        consensusProbability: probability,
+        volume: Number.isFinite(volume) ? volume : 0,
+        participants: 0,
+        lastUpdated: signal.timestamp,
+      },
+    ];
   }
 
   private async assessQuality(
@@ -138,12 +185,38 @@ and participant counts.`;
     historicalContext: string,
     crowdWisdom: CrowdWisdom[],
   ): Promise<MarketQualityScore> {
-    const system = `You are Inbrain's Market Quality Engine. You evaluate whether a social signal 
-should become a prediction market. Score each dimension 0-100. Be strict about verifiability.
+    const calibrationContext = await this.calibrationRules();
 
+    // Signals scraped from an existing prediction market arrive pre-formed: a
+    // resolution rule, a deadline and real liquidity already exist, so those
+    // dimensions score ~100 for free and the gate accepted everything (10 of 10
+    // in production, at 96-99/100, including League of Legends match markets).
+    // Tell the model not to award points for properties it did not have to
+    // judge, so the score reflects whether WE can add information.
+    const isDerivedFromMarket = EXISTING_MARKET_SOURCES.has(signal.source);
+    const derivedNote = isDerivedFromMarket
+      ? `
+IMPORTANT: this signal was scraped from an existing prediction market on ${signal.source}.
+Its verifiability, resolution criteria and deadline were written by that venue — they are
+NOT evidence of a good opportunity, so do NOT award high verifiability/timelineFeasibility
+points merely because the venue supplied them. Score this signal on whether OUR pipeline can
+add information the venue's own crowd does not already price in:
+  - verifiability: is the resolution rule objective AND independently checkable by us?
+  - historicalSimilarity: do we hold history that informs this specific question?
+  - communityPotential: does this matter to a macro/crypto audience, or is it niche
+    entertainment (individual sports fixtures, esports matches) with no analytical value?
+  - liquidityPotential: is the venue's volume meaningful, or is this a thin novelty market?
+  - timelineFeasibility: will it resolve soon enough to feed our calibration loop?
+Score niche entertainment fixtures LOW on communityPotential even when they are perfectly
+verifiable.
+`
+      : "";
+
+    const system = `You are Inbrain's Market Quality Engine. You evaluate whether a social signal
+should become a prediction market. Score each dimension 0-100. Be strict about verifiability.
+${derivedNote}${calibrationContext ? "\nApply these calibration rules from past accuracy analysis:\n" + calibrationContext + "\n" : ""}
 Respond with ONLY valid JSON matching this schema:
 {
-  "overall": number,
   "verifiability": number,
   "historicalSimilarity": number,
   "communityPotential": number,
@@ -173,9 +246,43 @@ Evaluate this signal for prediction market creation. Consider:
       model: this.modelId,
     });
 
+    const context = `assessQuality(${signal.id})`;
     try {
-      return JSON.parse(response) as MarketQualityScore;
-    } catch {
+      const raw = parseLlmJson<Record<string, unknown>>(response, context);
+
+      // Every dimension must be present and numeric. Defaulting a missing one
+      // to 0 would quietly understate the score; leaving it undefined made the
+      // whole sum NaN, and `NaN < threshold` is false — i.e. the signal was
+      // ACCEPTED. Both are wrong, so an incomplete answer is a rejection.
+      const verifiability = requireScore(raw.verifiability, "verifiability", context);
+      const historicalSimilarity = requireScore(raw.historicalSimilarity, "historicalSimilarity", context);
+      const communityPotential = requireScore(raw.communityPotential, "communityPotential", context);
+      const liquidityPotential = requireScore(raw.liquidityPotential, "liquidityPotential", context);
+      const timelineFeasibility = requireScore(raw.timelineFeasibility, "timelineFeasibility", context);
+
+      const overall = Math.round(
+        0.30 * verifiability +
+        0.20 * historicalSimilarity +
+        0.20 * communityPotential +
+        0.15 * liquidityPotential +
+        0.15 * timelineFeasibility
+      );
+
+      return {
+        overall,
+        verifiability,
+        historicalSimilarity,
+        communityPotential,
+        liquidityPotential,
+        timelineFeasibility,
+        reasoning: typeof raw.reasoning === "string" ? raw.reasoning : "",
+        historicalCases: Array.isArray(raw.historicalCases)
+          ? (raw.historicalCases as HistoricalCase[])
+          : [],
+        risks: optionalStringArray(raw.risks),
+      };
+    } catch (err) {
+      logValidationFailure(context, err);
       return {
         overall: 0,
         verifiability: 0,
@@ -183,9 +290,9 @@ Evaluate this signal for prediction market creation. Consider:
         communityPotential: 0,
         liquidityPotential: 0,
         timelineFeasibility: 0,
-        reasoning: "Failed to parse quality assessment",
+        reasoning: `Quality assessment could not be validated: ${(err as Error).message}`,
         historicalCases: [],
-        risks: ["Assessment parsing failed"],
+        risks: ["Assessment validation failed"],
       };
     }
   }
@@ -195,15 +302,19 @@ Evaluate this signal for prediction market creation. Consider:
     historicalContext: string,
     crowdWisdom: CrowdWisdom[],
   ): Promise<AIEstimate> {
-    const system = `You are Inbrain's AI probability estimator. Given a prediction signal and 
-historical context, estimate the YES probability. Be calibrated — don't default to 50%.
+    const calibrationContext = await this.calibrationRules();
 
+    const system = `You are Inbrain's AI probability estimator. Given a prediction signal and
+historical context, estimate the YES probability. Be calibrated — don't default to 50%.
+${calibrationContext ? "\nApply these calibration rules from past accuracy analysis:\n" + calibrationContext + "\n" : ""}
+${PROBABILITY_SCALE_RULE}
 Respond with ONLY valid JSON:
 {
   "yesProbability": number (0-1),
   "confidence": number (0-1),
   "reasoning": string,
-  "sources": [string]
+  "sources": [string],
+  "estimatedResolutionDays": number (1-365)
 }`;
 
     const prompt = `Signal: ${signal.content}
@@ -212,7 +323,7 @@ Historical Brain Context:
 ${historicalContext}
 
 Cross-Platform Consensus:
-${crowdWisdom.map((cw) => `${cw.platform}: ${Math.round(cw.consensusProbability * 100)}% YES (${cw.participants} participants)`).join("\n")}
+${crowdWisdom.map((cw) => `${cw.platform}: ${formatPercent(cw.consensusProbability)} YES (${cw.participants} participants)`).join("\n")}
 
 Estimate the probability that this event resolves YES.`;
 
@@ -220,19 +331,34 @@ Estimate the probability that this event resolves YES.`;
       model: this.modelId,
     });
 
+    const context = `generateEstimate(${signal.id})`;
     try {
-      const parsed = JSON.parse(response);
+      const raw = parseLlmJson<Record<string, unknown>>(response, context);
+      // Spreading `...parsed` used to let an absent yesProbability through as
+      // undefined, which then rendered as NaN% everywhere downstream.
       return {
-        ...parsed,
+        yesProbability: requireProbability(raw.yesProbability, "yesProbability", context),
+        confidence: requireProbability(raw.confidence, "confidence", context),
+        reasoning: typeof raw.reasoning === "string" ? raw.reasoning : "",
+        sources: optionalStringArray(raw.sources),
+        estimatedResolutionDays: requireIntInRange(
+          raw.estimatedResolutionDays ?? 30,
+          "estimatedResolutionDays",
+          context,
+          1,
+          365,
+        ),
         modelVersion: this.modelId,
         updatedAt: new Date(),
       };
-    } catch {
+    } catch (err) {
+      logValidationFailure(context, err);
       return {
         yesProbability: 0.5,
         confidence: 0.1,
-        reasoning: "Unable to generate estimate — using base rate",
+        reasoning: `Unable to generate estimate (${(err as Error).message}) — using base rate`,
         sources: [],
+        estimatedResolutionDays: 30,
         modelVersion: this.modelId,
         updatedAt: new Date(),
       };
@@ -245,8 +371,8 @@ Estimate the probability that this event resolves YES.`;
     estimate: AIEstimate,
   ): PredictionMarket {
     const category = this.inferCategory(signal);
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 30);
+    const daysUntilExpiry = estimate.estimatedResolutionDays ?? 30;
+    const expiresAt = new Date(Date.now() + daysUntilExpiry * 86400000);
 
     return {
       id: `mkt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -264,36 +390,36 @@ Estimate the probability that this event resolves YES.`;
         signalSource: signal.source,
         author: signal.author,
         authorInfluence: signal.authorInfluence,
+        // AnalystAgent.discoverAlpha reads metadata.crowdProbability. Nothing
+        // ever wrote it, so every market screened as "AI vs 0% crowd" — i.e.
+        // maximum divergence on every row.
+        crowdProbability: extractCrowdProbability(signal),
       },
     };
   }
 
   private inferCategory(signal: PredictionSignal): MarketCategory {
     const text = signal.content.toLowerCase();
-    if (
-      text.includes("bitcoin") ||
-      text.includes("ethereum") ||
-      text.includes("crypto") ||
-      text.includes("token")
-    )
+    // Whole-word matching. Substring matching sent almost everything to
+    // "technology" because "ai" appears inside said/chain/raise/available, and
+    // "sec"/"ban" matched second/sector/bank/urban.
+    const has = (...words: string[]): boolean =>
+      words.some((w) => new RegExp(`\\b${w}\\b`).test(text));
+
+    if (has("bitcoin", "btc", "ethereum", "eth", "crypto", "cryptocurrency", "token", "stablecoin", "defi"))
       return "crypto";
-    if (
-      text.includes("election") ||
-      text.includes("president") ||
-      text.includes("congress") ||
-      text.includes("vote")
-    )
+    if (has("election", "elections", "president", "presidential", "congress", "senate", "parliament", "vote", "votes", "ballot"))
       return "politics";
-    if (text.includes("ai") || text.includes("tech") || text.includes("model"))
-      return "technology";
-    if (text.includes("stock") || text.includes("fed") || text.includes("rate"))
-      return "finance";
-    if (
-      text.includes("regulation") ||
-      text.includes("sec") ||
-      text.includes("ban")
-    )
+    if (has("regulation", "regulatory", "sec", "cftc", "lawsuit", "ban", "sanction", "sanctions", "legislation"))
       return "regulation";
+    if (has("fed", "fomc", "inflation", "cpi", "interest rate", "rates", "stock", "stocks", "earnings", "gdp", "recession"))
+      return "finance";
+    if (has("ai", "llm", "gpt", "chip", "chips", "semiconductor", "software", "startup", "model", "models"))
+      return "technology";
+    if (has("nba", "nfl", "fifa", "olympics", "match", "tournament", "league", "playoffs", "esports", "lol", "dota"))
+      return "sports";
+    if (has("science", "vaccine", "climate", "nasa", "spacex", "launch"))
+      return "science";
     return "other";
   }
 
@@ -318,8 +444,8 @@ expires: ${market.expiresAt.toISOString()}
 # ${market.title}
 
 ## AI Estimate
-- YES Probability: ${Math.round(market.aiEstimate.yesProbability * 100)}%
-- Confidence: ${Math.round(market.aiEstimate.confidence * 100)}%
+- YES Probability: ${formatPercent(market.aiEstimate.yesProbability)}
+- Confidence: ${formatPercent(market.aiEstimate.confidence)}
 - Reasoning: ${market.aiEstimate.reasoning}
 
 ## Quality Assessment

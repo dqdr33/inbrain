@@ -16,6 +16,23 @@ import type {
   TrendInsight,
   MetaModelUpdate,
 } from "./types.js";
+import { parseLlmJson, logValidationFailure, optionalStringArray } from "./llm-json.js";
+import { CALIBRATION_SLUG, renderCalibrationPage, type CalibrationRule } from "./calibration.js";
+import { formatPercent } from "./format.js";
+
+/** Brain slugs are filesystem-ish paths. Topic text comes straight from an LLM,
+ *  so it must never be able to steer the write target. */
+function safeSlugSegment(text: string): string {
+  return (
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .trim()
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .slice(0, 80) || "untitled"
+  );
+}
 
 export interface DreamCycleOptions {
   brainQuery?: (query: string) => Promise<string>;
@@ -52,6 +69,24 @@ export class DreamCycle {
     this.maxRunTimeMs = (opts.maxRunTimeMinutes ?? 60) * 60_000;
   }
 
+  /** A brainQuery that failed returns a marker string rather than throwing, so
+   *  callers must be able to recognise it before treating it as knowledge. */
+  private looksLikeBrainFailure(text: string): boolean {
+    return /^\s*Brain query failed|^\s*No brain connection/i.test(text);
+  }
+
+  /** Throws once the cycle has outlived maxRunTimeMinutes. The budget was
+   *  computed in the constructor and then never consulted, so a stuck phase
+   *  could run indefinitely. */
+  private checkDeadline(startedAt: number, phase: string): void {
+    const elapsed = Date.now() - startedAt;
+    if (elapsed > this.maxRunTimeMs) {
+      throw new Error(
+        `dream cycle exceeded its ${Math.round(this.maxRunTimeMs / 60_000)} minute budget before ${phase} (elapsed ${Math.round(elapsed / 1000)}s)`,
+      );
+    }
+  }
+
   async run(): Promise<DreamCycleReport> {
     const startTime = Date.now();
     console.log("[dream-cycle] 🌙 Starting nightly self-evolution...");
@@ -65,20 +100,29 @@ export class DreamCycle {
     const accuracy = await this.reviewAccuracy(resolved);
 
     // Phase 2: Generate forecasts
+    this.checkDeadline(startTime, "phase 2");
     console.log("[dream-cycle] Phase 2/5: Generating tomorrow's forecasts...");
     const forecasts = await this.generateForecasts(all);
 
     // Phase 3: Find and fill knowledge gaps
+    this.checkDeadline(startTime, "phase 3");
     console.log("[dream-cycle] Phase 3/5: Discovering knowledge gaps...");
     const { gapsFound, gapsFilled } = await this.discoverAndFillGaps(all);
 
     // Phase 4: Update meta-model
+    this.checkDeadline(startTime, "phase 4");
     console.log("[dream-cycle] Phase 4/5: Updating meta-prediction model...");
     const metaUpdates = await this.updateMetaModel(resolved);
 
     // Phase 5: Trend analysis
+    this.checkDeadline(startTime, "phase 5");
     console.log("[dream-cycle] Phase 5/5: Analyzing trends...");
     const trends = await this.analyzeTrends(all);
+
+    // Persist the meta-model as the page BrainAgent actually reads. Without
+    // this the loop is open: findings only ever reached the human-readable
+    // dream report, so every evaluation queried an address nothing wrote.
+    await this.publishCalibration(metaUpdates, resolved, accuracy);
 
     const duration = Date.now() - startTime;
 
@@ -106,10 +150,46 @@ export class DreamCycle {
     return report;
   }
 
+  /** Write the calibration rules page BrainAgent reads before every evaluation.
+   *  Always written, even with zero rules, so the read side gets an honest
+   *  "not enough history yet" instead of an empty search result. */
+  private async publishCalibration(
+    updates: MetaModelUpdate[],
+    resolved: PredictionMarket[],
+    accuracy: number | null,
+  ): Promise<void> {
+    const rules: CalibrationRule[] = updates.map((u) => ({
+      rule: u.rule,
+      previousValue: u.previousValue,
+      newValue: u.newValue,
+      evidence: u.evidence,
+    }));
+
+    const avgBrierScore = accuracy === null ? null : 1 - accuracy;
+
+    try {
+      await this.brainWrite(
+        CALIBRATION_SLUG,
+        renderCalibrationPage(rules, {
+          marketsReviewed: resolved.length,
+          avgBrierScore,
+        }),
+      );
+      console.log(
+        `[dream-cycle] calibration page updated (${rules.length} rule(s), ${resolved.length} resolved market(s))`,
+      );
+    } catch (err) {
+      console.error(`[dream-cycle] failed to publish calibration: ${(err as Error).message}`);
+    }
+  }
+
+  /** Mean-Brier-derived accuracy, or null when nothing has resolved yet.
+   *  Returning 0 for "no data" printed "Accuracy 0.0%" — indistinguishable
+   *  from catastrophically bad calibration. */
   private async reviewAccuracy(
     resolved: PredictionMarket[],
-  ): Promise<number> {
-    if (resolved.length === 0) return 0;
+  ): Promise<number | null> {
+    if (resolved.length === 0) return null;
 
     let totalBrier = 0;
     let count = 0;
@@ -122,11 +202,16 @@ export class DreamCycle {
       count++;
     }
 
-    const avgBrier = count > 0 ? totalBrier / count : 0;
+    if (count === 0) return null;
+
+    const avgBrier = totalBrier / count;
     const accuracy = 1 - avgBrier; // inverted Brier: higher = better
 
+    // Dated slug: the old fixed `accuracy-log` slug overwrote itself every
+    // night, so the accuracy history the meta-model is supposed to learn from
+    // never accumulated.
     await this.brainWrite(
-      `predictions/meta/accuracy-log`,
+      `predictions/meta/accuracy/${new Date().toISOString().slice(0, 10)}`,
       `---
 type: meta-accuracy
 date: ${new Date().toISOString()}
@@ -172,7 +257,7 @@ ${markets
   .slice(0, 15)
   .map(
     (m) =>
-      `- ${m.title.slice(0, 80)} (${m.category}, YES: ${Math.round(m.aiEstimate.yesProbability * 100)}%)`,
+      `- ${m.title.slice(0, 80)} (${m.category}, YES: ${formatPercent(m.aiEstimate.yesProbability)})`,
   )
   .join("\n")}
 
@@ -219,25 +304,36 @@ What knowledge gaps exist that would improve prediction accuracy?`;
     const gapsFound: string[] = [];
     const gapsFilled: string[] = [];
 
+    const context = "discoverAndFillGaps";
     try {
-      const parsed = JSON.parse(response);
-      const gaps = parsed.gaps ?? [];
+      const parsed = parseLlmJson<{ gaps?: unknown }>(response, context);
+      const gaps = Array.isArray(parsed.gaps) ? parsed.gaps : [];
 
-      for (const gap of gaps.slice(0, 10)) {
+      for (const item of gaps.slice(0, 10)) {
+        if (!item || typeof item !== "object") continue;
+        const gap = item as Record<string, unknown>;
+        if (typeof gap.topic !== "string" || !gap.topic.trim()) continue;
         gapsFound.push(gap.topic);
 
-        if (gap.importance === "critical" || gap.importance === "high") {
-          try {
-            const fillResult = await this.brainQuery(gap.searchQuery);
-            if (
-              fillResult &&
-              !fillResult.includes("No brain connection") &&
-              fillResult.length > 100
-            ) {
-              gapsFilled.push(gap.topic);
-              await this.brainWrite(
-                `predictions/knowledge/${gap.topic.toLowerCase().replace(/\s+/g, "-")}`,
-                `---
+        if (gap.importance !== "critical" && gap.importance !== "high") continue;
+        if (typeof gap.searchQuery !== "string" || !gap.searchQuery.trim()) continue;
+
+        try {
+          const fillResult = await this.brainQuery(gap.searchQuery);
+          // The old guard tested for the literal "No brain connection", which
+          // the production runner never emits — so a brain ERROR MESSAGE was
+          // written back into the brain as filled knowledge.
+          if (
+            fillResult &&
+            !this.looksLikeBrainFailure(fillResult) &&
+            fillResult.length > 100
+          ) {
+            gapsFilled.push(gap.topic);
+            await this.brainWrite(
+              // Topic text is model output; without sanitising it, the model
+              // controls the write path.
+              `predictions/knowledge/${safeSlugSegment(gap.topic)}`,
+              `---
 type: knowledge-gap-fill
 topic: ${gap.topic}
 importance: ${gap.importance}
@@ -248,15 +344,14 @@ filled_at: ${new Date().toISOString()}
 
 ${fillResult}
 `,
-              );
-            }
-          } catch {
-            // gap fill failed — non-critical
+            );
           }
+        } catch (err) {
+          console.error(`[dream-cycle] gap fill failed for "${gap.topic}": ${(err as Error).message}`);
         }
       }
-    } catch {
-      // parse failed
+    } catch (err) {
+      logValidationFailure(context, err);
     }
 
     return { gapsFound, gapsFilled };
@@ -284,9 +379,12 @@ Respond with ONLY a valid JSON array:
 ${resolved
   .slice(0, 30)
   .map((m) => {
-    const predicted = Math.round(m.aiEstimate.yesProbability * 100);
+    // Display only — the Brier arithmetic downstream uses the raw probability,
+    // never this string. A long shot that resolved YES is the single most
+    // informative row here, so it must not arrive as "0%".
+    const predicted = formatPercent(m.aiEstimate.yesProbability);
     const actual = m.resolution?.outcome === "yes" ? "YES" : "NO";
-    return `- [${m.category}] ${m.title.slice(0, 60)} | Predicted: ${predicted}% YES | Actual: ${actual}`;
+    return `- [${m.category}] ${m.title.slice(0, 60)} | Predicted: ${predicted} YES | Actual: ${actual}`;
   })
   .join("\n")}
 
@@ -294,9 +392,30 @@ Discover calibration patterns and biases.`;
 
     const response = await this.llmCall(system, prompt);
 
+    const context = "updateMetaModel";
     try {
-      return JSON.parse(response) as MetaModelUpdate[];
-    } catch {
+      const parsed = parseLlmJson<unknown>(response, context);
+      if (!Array.isArray(parsed)) return [];
+      // Validate here rather than at render time: saveDreamReport calls
+      // previousValue.toFixed(2), which threw out of run() after every LLM
+      // call had already been paid for.
+      return parsed.flatMap((item): MetaModelUpdate[] => {
+        if (!item || typeof item !== "object") return [];
+        const row = item as Record<string, unknown>;
+        const prev = Number(row.previousValue);
+        const next = Number(row.newValue);
+        if (typeof row.rule !== "string" || !Number.isFinite(prev) || !Number.isFinite(next)) {
+          return [];
+        }
+        return [{
+          rule: row.rule,
+          previousValue: prev,
+          newValue: next,
+          evidence: typeof row.evidence === "string" ? row.evidence : "",
+        }];
+      });
+    } catch (err) {
+      logValidationFailure(context, err);
       return [];
     }
   }
@@ -339,9 +458,27 @@ Identify top trends.`;
 
     const response = await this.llmCall(system, prompt);
 
+    const context = "analyzeTrends";
     try {
-      return JSON.parse(response) as TrendInsight[];
-    } catch {
+      const parsed = parseLlmJson<unknown>(response, context);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.flatMap((item): TrendInsight[] => {
+        if (!item || typeof item !== "object") return [];
+        const row = item as Record<string, unknown>;
+        if (typeof row.topic !== "string") return [];
+        const direction =
+          row.direction === "rising" || row.direction === "falling" ? row.direction : "stable";
+        const confidence = Number(row.confidence);
+        return [{
+          topic: row.topic,
+          direction,
+          confidence: Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : 0,
+          relatedEvents: optionalStringArray(row.relatedEvents),
+          prediction: typeof row.prediction === "string" ? row.prediction : "",
+        }];
+      });
+    } catch (err) {
+      logValidationFailure(context, err);
       return [];
     }
   }
@@ -350,12 +487,19 @@ Identify top trends.`;
     const date = new Date().toISOString().split("T")[0];
     const slug = `predictions/dreams/${date}`;
 
+    const accuracyValue =
+      report.predictionsAccuracy === null ? "n/a" : report.predictionsAccuracy.toFixed(4);
+    const accuracyText =
+      report.predictionsAccuracy === null
+        ? "no resolved markets yet"
+        : `${(report.predictionsAccuracy * 100).toFixed(1)}%`;
+
     const content = `---
 type: dream-cycle-report
 date: ${date}
 duration_seconds: ${Math.round(report.duration / 1000)}
 markets_reviewed: ${report.marketsReviewed}
-accuracy: ${report.predictionsAccuracy.toFixed(4)}
+accuracy: ${accuracyValue}
 gaps_found: ${report.knowledgeGapsFound.length}
 gaps_filled: ${report.knowledgeGapsFilled.length}
 forecasts: ${report.tomorrowPredictions.length}
@@ -365,11 +509,11 @@ forecasts: ${report.tomorrowPredictions.length}
 
 ## Performance Summary
 - Markets Reviewed: ${report.marketsReviewed}
-- Prediction Accuracy: ${(report.predictionsAccuracy * 100).toFixed(1)}%
+- Prediction Accuracy: ${accuracyText}
 - Duration: ${Math.round(report.duration / 1000)}s
 
 ## Tomorrow's Forecasts
-${report.tomorrowPredictions.map((f) => `### ${f.title}\n- Category: ${f.category}\n- Estimated Probability: ${Math.round(f.estimatedProbability * 100)}%\n- Reasoning: ${f.reasoning}\n`).join("\n")}
+${report.tomorrowPredictions.map((f) => `### ${f.title}\n- Category: ${f.category}\n- Estimated Probability: ${formatPercent(f.estimatedProbability)}\n- Reasoning: ${f.reasoning}\n`).join("\n")}
 
 ## Trend Analysis
 ${report.trendAnalysis.map((t) => `- **${t.topic}** (${t.direction}): ${t.prediction}`).join("\n")}

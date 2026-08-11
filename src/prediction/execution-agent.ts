@@ -10,6 +10,15 @@ import type {
   MarketResolution,
   AIEstimate,
 } from "./types.js";
+import {
+  parseLlmJson,
+  isExplicitNull,
+  requireProbability,
+  optionalStringArray,
+  logValidationFailure,
+  PROBABILITY_SCALE_RULE,
+} from "./llm-json.js";
+import { formatPercent } from "./format.js";
 
 const DEFAULT_MONITOR_INTERVAL_MS = 300_000; // 5 minutes
 const DEFAULT_RESOLUTION_CONFIDENCE = 0.9;
@@ -52,6 +61,7 @@ export class ExecutionAgent {
   private activeMarkets: Map<string, PredictionMarket> = new Map();
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  private cycling = false;
 
   constructor(opts: ExecutionAgentOptions = {}) {
     this.monitorIntervalMs =
@@ -60,10 +70,13 @@ export class ExecutionAgent {
     this.resolutionThreshold =
       opts.resolutionConfidenceThreshold ?? DEFAULT_RESOLUTION_CONFIDENCE;
 
-    this.brainQuery =
-      opts.brainQuery ?? (async () => "No brain connection configured.");
+    this.brainQuery = opts.brainQuery ?? (async () => "");
     this.brainWrite = opts.brainWrite ?? (async () => {});
-    this.llmCall = opts.llmCall ?? (async () => "LLM not configured.");
+    this.llmCall =
+      opts.llmCall ??
+      (async () => {
+        throw new Error("ExecutionAgent: no llmCall configured");
+      });
     this.onMarketUpdate = opts.onMarketUpdate;
     this.onMarketResolved = opts.onMarketResolved;
   }
@@ -81,7 +94,31 @@ export class ExecutionAgent {
     console.log(
       `[execution-agent] started — monitoring ${this.activeMarkets.size} markets`,
     );
-    this.timer = setInterval(() => this.monitorCycle(), this.monitorIntervalMs);
+    this.timer = setInterval(() => {
+      // A floating promise here becomes an unhandled rejection, which is fatal
+      // under Bun.
+      void this.runMonitorCycle().catch((err) =>
+        console.error("[execution-agent] monitor cycle failed:", err),
+      );
+    }, this.monitorIntervalMs);
+  }
+
+  /**
+   * Run exactly one monitor pass. Exposed so a one-shot scheduled run (the way
+   * this pipeline is actually deployed on Windows Task Scheduler) can drive
+   * market lifecycle without keeping a daemon alive.
+   */
+  async runMonitorCycle(): Promise<void> {
+    if (this.cycling) {
+      console.warn("[execution-agent] previous monitor cycle still running — skipping");
+      return;
+    }
+    this.cycling = true;
+    try {
+      await this.monitorCycle();
+    } finally {
+      this.cycling = false;
+    }
   }
 
   stop(): void {
@@ -97,6 +134,12 @@ export class ExecutionAgent {
     for (const [id, market] of this.activeMarkets) {
       if (market.status === "resolved" || market.status === "cancelled")
         continue;
+
+      // A market that expired without resolvable evidence is parked in
+      // pending_resolution awaiting a human. Re-running auto-resolution on it
+      // every cycle burned two LLM calls per expired market, every 5 minutes,
+      // forever — and never produced a different answer.
+      if (market.status === "pending_resolution") continue;
 
       try {
         if (new Date() >= market.expiresAt) {
@@ -129,13 +172,14 @@ export class ExecutionAgent {
   private async refreshEstimate(
     market: PredictionMarket,
   ): Promise<AIEstimate | null> {
-    const context = await this.brainQuery(
+    const brainContext = await this.brainQuery(
       `Latest developments for prediction market: "${market.title}". Include recent news, social media activity, and on-chain data.`,
     );
 
-    const system = `You are Inbrain's real-time probability updater. Given a market and new context, 
+    const system = `You are Inbrain's real-time probability updater. Given a market and new context,
 decide if the probability should change. If no meaningful new info, respond with null.
 
+${PROBABILITY_SCALE_RULE}
 Respond with ONLY valid JSON (or the word "null"):
 {
   "yesProbability": number (0-1),
@@ -145,32 +189,41 @@ Respond with ONLY valid JSON (or the word "null"):
 }`;
 
     const prompt = `Market: ${market.title}
-Current YES: ${Math.round(market.aiEstimate.yesProbability * 100)}%
-Current Confidence: ${Math.round(market.aiEstimate.confidence * 100)}%
+Current YES: ${formatPercent(market.aiEstimate.yesProbability)}
+Current Confidence: ${formatPercent(market.aiEstimate.confidence)}
 
 New Context:
-${context}
+${brainContext}
 
 Should the probability be updated? Only update if there's meaningful new evidence.`;
 
     const response = await this.llmCall(system, prompt);
 
-    if (response.trim() === "null" || response.trim() === '"null"')
-      return null;
+    if (isExplicitNull(response)) return null;
 
+    const context = `refreshEstimate(${market.id})`;
     try {
-      const parsed = JSON.parse(response);
-      const delta = Math.abs(
-        parsed.yesProbability - market.aiEstimate.yesProbability,
-      );
+      const raw = parseLlmJson<Record<string, unknown>>(response, context);
+      // A missing yesProbability made `delta` NaN, and `NaN < 0.02` is false —
+      // so the malformed estimate was written into the market and the stored
+      // probability became undefined.
+      const yesProbability = requireProbability(raw.yesProbability, "yesProbability", context);
+      const confidence = requireProbability(raw.confidence, "confidence", context);
+
+      const delta = Math.abs(yesProbability - market.aiEstimate.yesProbability);
       if (delta < 0.02) return null; // skip trivial changes
 
       return {
-        ...parsed,
+        yesProbability,
+        confidence,
+        reasoning: typeof raw.reasoning === "string" ? raw.reasoning : "",
+        sources: optionalStringArray(raw.sources),
+        estimatedResolutionDays: market.aiEstimate.estimatedResolutionDays,
         modelVersion: market.aiEstimate.modelVersion,
         updatedAt: new Date(),
       };
-    } catch {
+    } catch (err) {
+      logValidationFailure(context, err);
       return null;
     }
   }
@@ -183,6 +236,7 @@ can be definitively resolved based on publicly verifiable information.
 
 Only resolve if confidence >= ${this.resolutionThreshold * 100}%.
 
+${PROBABILITY_SCALE_RULE}
 Respond with ONLY valid JSON (or "null" if not resolvable yet):
 {
   "outcome": "yes" | "no",
@@ -207,21 +261,41 @@ Can this market be resolved now with high confidence?`;
 
     const response = await this.llmCall(system, prompt);
 
-    if (response.trim() === "null" || response.trim() === '"null"')
-      return null;
+    if (isExplicitNull(response)) return null;
 
+    const context = `checkForEarlyResolution(${market.id})`;
     try {
-      const parsed = JSON.parse(response);
-      if (parsed.confidence < this.resolutionThreshold) return null;
+      const raw = parseLlmJson<Record<string, unknown>>(response, context);
+
+      // Fail CLOSED. `undefined < 0.9` is false, so an answer with no
+      // confidence field used to resolve the market — the single most
+      // consequential decision this agent makes, taken on missing data.
+      const confidence = requireProbability(raw.confidence, "confidence", context);
+      if (confidence < this.resolutionThreshold) return null;
+
+      if (raw.outcome !== "yes" && raw.outcome !== "no") {
+        logValidationFailure(
+          context,
+          new Error(`outcome must be "yes" or "no", got ${JSON.stringify(raw.outcome)}`),
+        );
+        return null;
+      }
+
+      const evidence = optionalStringArray(raw.evidence);
+      if (evidence.length === 0) {
+        logValidationFailure(context, new Error("resolution carried no evidence"));
+        return null;
+      }
 
       return {
-        outcome: parsed.outcome,
+        outcome: raw.outcome,
         resolvedBy: "auto",
-        evidence: parsed.evidence ?? [],
-        verificationSources: parsed.verificationSources ?? [],
+        evidence,
+        verificationSources: optionalStringArray(raw.verificationSources),
         resolvedAt: new Date(),
       };
-    } catch {
+    } catch (err) {
+      logValidationFailure(context, err);
       return null;
     }
   }
@@ -245,7 +319,11 @@ Can this market be resolved now with high confidence?`;
     market.status = "resolved";
     market.resolution = resolution;
     market.resolvedAt = resolution.resolvedAt;
-    this.activeMarkets.set(market.id, market);
+
+    // Hand the market off and stop tracking it. Keeping resolved markets in the
+    // map forever meant the monitor loop's iteration cost — and memory — grew
+    // without bound over a long-running process.
+    this.activeMarkets.delete(market.id);
 
     await this.recordResolution(market, resolution);
     await this.onMarketResolved?.(market, resolution);
@@ -280,7 +358,7 @@ resolved_at: ${resolution.resolvedAt.toISOString()}
 **${resolution.outcome.toUpperCase()}** (resolved by: ${resolution.resolvedBy})
 
 ## AI Performance
-- AI Prediction: ${Math.round(aiPrediction * 100)}% YES
+- AI Prediction: ${formatPercent(aiPrediction)} YES
 - Actual: ${resolution.outcome.toUpperCase()}
 - Brier Score: ${brierScore.toFixed(4)} (lower is better)
 - ${brierScore < 0.1 ? "Excellent calibration" : brierScore < 0.25 ? "Good calibration" : "Needs improvement"}

@@ -10,6 +10,31 @@ import type {
   TrendInsight,
   MarketCategory,
 } from "./types.js";
+import {
+  parseLlmJson,
+  requireProbability,
+  optionalStringArray,
+  logValidationFailure,
+} from "./llm-json.js";
+import { formatPercent } from "./format.js";
+
+/**
+ * Mean Brier score over markets that actually resolved, or null when there is
+ * nothing to score.
+ *
+ * This used to be a field in the LLM's JSON schema — the model was asked to
+ * report `avgBrierScore` despite the prompt containing no resolved-market data
+ * at all, so the number was invented. Calibration is arithmetic; compute it.
+ */
+export function computeAvgBrierScore(markets: PredictionMarket[]): number | null {
+  const scored = markets.filter((m) => m.resolution && m.resolution.outcome !== "cancelled");
+  if (scored.length === 0) return null;
+  const total = scored.reduce((sum, m) => {
+    const actual = m.resolution!.outcome === "yes" ? 1 : 0;
+    return sum + Math.pow(m.aiEstimate.yesProbability - actual, 2);
+  }, 0);
+  return total / scored.length;
+}
 
 export interface AnalystAgentOptions {
   brainQuery?: (query: string) => Promise<string>;
@@ -55,22 +80,17 @@ export class AnalystAgent {
       "Summarize today's prediction market activity, notable outcomes, and emerging trends.",
     );
 
-    const system = `You are Inbrain's Analyst Agent. Generate a concise daily intelligence report 
+    const system = `You are Inbrain's Analyst Agent. Generate a concise daily intelligence report
 covering prediction market performance, notable outcomes, and emerging opportunities.
 
 Respond with ONLY valid JSON:
 {
   "summary": string,
-  "topMarkets": [{"title": string, "probability": number, "trend": "up"|"down"|"stable"}],
+  "topMarkets": [{"title": string, "probability": number (0.0–1.0 scale, NOT a percentage — e.g. 0.04 means 4%), "trend": "up"|"down"|"stable"}],
   "alphaOpportunities": [{"title": string, "reasoning": string, "urgency": "high"|"medium"|"low"}],
-  "trends": [{"topic": string, "direction": "rising"|"falling"|"stable", "confidence": number, "prediction": string}],
-  "performanceMetrics": {
-    "totalActive": number,
-    "resolvedToday": number,
-    "avgBrierScore": number,
-    "bestPrediction": string,
-    "worstPrediction": string
-  }
+  "trends": [{"topic": string, "direction": "rising"|"falling"|"stable", "confidence": number (0.0–1.0), "prediction": string}],
+  "bestPrediction": string,
+  "worstPrediction": string
 }`;
 
     const prompt = `Active Markets (${activeMarkets.length}):
@@ -78,7 +98,7 @@ ${activeMarkets
   .slice(0, 20)
   .map(
     (m) =>
-      `- ${m.title.slice(0, 100)} (YES: ${Math.round(m.aiEstimate.yesProbability * 100)}%, category: ${m.category})`,
+      `- ${m.title.slice(0, 100)} (YES: ${formatPercent(m.aiEstimate.yesProbability)}, category: ${m.category})`,
   )
   .join("\n")}
 
@@ -86,7 +106,7 @@ Resolved Today (${resolvedToday.length}):
 ${resolvedToday
   .map(
     (m) =>
-      `- ${m.title.slice(0, 100)} → ${m.resolution?.outcome.toUpperCase()} (AI predicted: ${Math.round(m.aiEstimate.yesProbability * 100)}%)`,
+      `- ${m.title.slice(0, 100)} → ${m.resolution?.outcome.toUpperCase()} (AI predicted: ${formatPercent(m.aiEstimate.yesProbability)})`,
   )
   .join("\n")}
 
@@ -97,35 +117,61 @@ Generate the daily intelligence report.`;
 
     const response = await this.llmCall(system, prompt);
 
-    try {
-      const parsed = JSON.parse(response);
-      const report: DailyReport = {
-        date: new Date(),
-        ...parsed,
-        activeMarkets: activeMarkets.length,
-        resolvedMarkets: resolvedToday.length,
-      };
+    // Computed here, never asked of the model.
+    const avgBrierScore = computeAvgBrierScore(markets);
 
-      await this.distribute(this.formatDailyReport(report));
-      return report;
-    } catch {
-      return {
+    const metrics = {
+      totalActive: activeMarkets.length,
+      resolvedToday: resolvedToday.length,
+      avgBrierScore,
+      bestPrediction: "",
+      worstPrediction: "",
+    };
+
+    const context = "generateDailyReport";
+    let report: DailyReport;
+    try {
+      const parsed = parseLlmJson<Record<string, unknown>>(response, context);
+      // Field-by-field instead of `...parsed`: spreading let the model overwrite
+      // `date` with a string (breaking date.toISOString() downstream) and let a
+      // missing topMarkets/trends array through as undefined, which then threw
+      // inside formatDailyReport and was swallowed as "report generation failed".
+      report = {
         date: new Date(),
-        summary: "Failed to generate daily report",
-        topMarkets: [],
-        alphaOpportunities: [],
-        trends: [],
+        summary: typeof parsed.summary === "string" ? parsed.summary : "",
+        topMarkets: normaliseTopMarkets(parsed.topMarkets, context),
+        alphaOpportunities: normaliseAlpha(parsed.alphaOpportunities),
+        trends: normaliseTrends(parsed.trends),
         performanceMetrics: {
-          totalActive: activeMarkets.length,
-          resolvedToday: resolvedToday.length,
-          avgBrierScore: 0,
-          bestPrediction: "",
-          worstPrediction: "",
+          ...metrics,
+          bestPrediction: typeof parsed.bestPrediction === "string" ? parsed.bestPrediction : "",
+          worstPrediction: typeof parsed.worstPrediction === "string" ? parsed.worstPrediction : "",
         },
         activeMarkets: activeMarkets.length,
         resolvedMarkets: resolvedToday.length,
       };
+    } catch (err) {
+      logValidationFailure(context, err);
+      report = {
+        date: new Date(),
+        summary: `Report generation failed: ${(err as Error).message}`,
+        topMarkets: [],
+        alphaOpportunities: [],
+        trends: [],
+        performanceMetrics: metrics,
+        activeMarkets: activeMarkets.length,
+        resolvedMarkets: resolvedToday.length,
+      };
     }
+
+    // Distribution is outside the try: a Telegram/Discord failure must not be
+    // reported as "the model produced a bad report".
+    try {
+      await this.distribute(this.formatDailyReport(report));
+    } catch (err) {
+      console.error(`[analyst-agent] distribution failed: ${(err as Error).message}`);
+    }
+    return report;
   }
 
   async generateWeeklyTrends(
@@ -155,7 +201,7 @@ ${Object.entries(categoryGroups)
         .slice(0, 5)
         .map(
           (m) =>
-            `  - ${m.title.slice(0, 80)} (YES: ${Math.round(m.aiEstimate.yesProbability * 100)}%)`,
+            `  - ${m.title.slice(0, 80)} (YES: ${formatPercent(m.aiEstimate.yesProbability)})`,
         )
         .join("\n")}`,
   )
@@ -169,15 +215,16 @@ Identify the top 5-10 weekly trends.`;
     const response = await this.llmCall(system, prompt);
 
     try {
-      return JSON.parse(response) as TrendInsight[];
-    } catch {
+      return normaliseTrends(parseLlmJson(response, "generateWeeklyTrends"));
+    } catch (err) {
+      logValidationFailure("generateWeeklyTrends", err);
       return [];
     }
   }
 
   async discoverAlpha(markets: PredictionMarket[]): Promise<AlphaDiscovery[]> {
     const system = `You are Inbrain's Alpha Discovery Engine. Find prediction markets where the AI 
-estimate significantly diverges from crowd consensus, indicating potential mispricing.
+estimate significantly diverges from crowd consensus, indicating potential mispricing. Both AI and crowd estimates are provided.
 
 Respond with ONLY a valid JSON array:
 [{
@@ -191,14 +238,25 @@ Respond with ONLY a valid JSON array:
   "confidence": number
 }]`;
 
+    // Only markets that actually carry a crowd number can be screened. Rows
+    // without one used to be shown as "Crowd: 0%", which made every single
+    // market look like a maximum-divergence opportunity.
+    const screenable = markets
+      .filter((m) => m.status === "active")
+      .filter((m) => typeof m.metadata?.crowdProbability === "number")
+      .slice(0, 30);
+
+    if (screenable.length === 0) {
+      console.error("[analyst-agent] discoverAlpha: no markets carry a crowd probability — skipping");
+      return [];
+    }
+
     const prompt = `Active markets for alpha screening:
-${markets
-  .filter((m) => m.status === "active")
-  .slice(0, 30)
-  .map(
-    (m) =>
-      `- [${m.id}] ${m.title.slice(0, 80)} | AI: ${Math.round(m.aiEstimate.yesProbability * 100)}% | Confidence: ${Math.round(m.aiEstimate.confidence * 100)}%`,
-  )
+${screenable
+  .map((m) => {
+    const crowdProb = m.metadata.crowdProbability as number;
+    return `- [${m.id}] ${m.title.slice(0, 80)} | AI: ${formatPercent(m.aiEstimate.yesProbability)} | Crowd: ${formatPercent(crowdProb)} | Confidence: ${formatPercent(m.aiEstimate.confidence)}`;
+  })
   .join("\n")}
 
 Find markets with significant AI-vs-crowd divergence (potential alpha).`;
@@ -206,8 +264,10 @@ Find markets with significant AI-vs-crowd divergence (potential alpha).`;
     const response = await this.llmCall(system, prompt);
 
     try {
-      return JSON.parse(response) as AlphaDiscovery[];
-    } catch {
+      const parsed = parseLlmJson<unknown>(response, "discoverAlpha");
+      return Array.isArray(parsed) ? (parsed as AlphaDiscovery[]) : [];
+    } catch (err) {
+      logValidationFailure("discoverAlpha", err);
       return [];
     }
   }
@@ -228,9 +288,9 @@ Find markets with significant AI-vs-crowd divergence (potential alpha).`;
       for (const m of report.topMarkets.slice(0, 5)) {
         const arrow =
           m.trend === "up" ? "↑" : m.trend === "down" ? "↓" : "→";
-        lines.push(
-          `  ${arrow} ${m.title} — ${Math.round(m.probability * 100)}% YES`,
-        );
+        // probability is already normalised to 0-1 by normaliseTopMarkets, so
+        // no >= 2 "is this a percentage?" guesswork is needed here any more.
+        lines.push(`  ${arrow} ${m.title} — ${formatPercent(m.probability)} YES`);
       }
       lines.push("");
     }
@@ -284,7 +344,67 @@ Find markets with significant AI-vs-crowd divergence (potential alpha).`;
   }
 }
 
-function isToday(date: Date): boolean {
+/** Probability fields arrive on either a 0-1 or a 0-100 scale depending on the
+ *  model's mood. Normalise once, here, so the renderer never has to guess. */
+function normaliseTopMarkets(value: unknown, context: string): DailyReport["topMarkets"] {
+  if (!Array.isArray(value)) return [];
+  const out: DailyReport["topMarkets"] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.title !== "string") continue;
+    let probability: number;
+    try {
+      probability = requireProbability(row.probability, "topMarkets[].probability", context);
+    } catch (err) {
+      logValidationFailure(context, err);
+      continue;
+    }
+    const trend = row.trend === "up" || row.trend === "down" ? row.trend : "stable";
+    out.push({ title: row.title, probability, trend });
+  }
+  return out;
+}
+
+function normaliseAlpha(value: unknown): DailyReport["alphaOpportunities"] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as Record<string, unknown>;
+    if (typeof row.title !== "string") return [];
+    const urgency =
+      row.urgency === "high" || row.urgency === "medium" || row.urgency === "low"
+        ? row.urgency
+        : "low";
+    return [{
+      title: row.title,
+      reasoning: typeof row.reasoning === "string" ? row.reasoning : "",
+      urgency,
+    }];
+  });
+}
+
+function normaliseTrends(value: unknown): TrendInsight[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as Record<string, unknown>;
+    if (typeof row.topic !== "string") return [];
+    const direction =
+      row.direction === "rising" || row.direction === "falling" ? row.direction : "stable";
+    const confidence = Number(row.confidence);
+    return [{
+      topic: row.topic,
+      direction,
+      confidence: Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence > 1 ? confidence / 100 : confidence)) : 0,
+      relatedEvents: optionalStringArray(row.relatedEvents),
+      prediction: typeof row.prediction === "string" ? row.prediction : "",
+    }];
+  });
+}
+
+function isToday(dateInput: Date | string): boolean {
+  const date = new Date(dateInput);
   const now = new Date();
   return (
     date.getFullYear() === now.getFullYear() &&
@@ -320,7 +440,9 @@ export interface DailyReport {
   performanceMetrics: {
     totalActive: number;
     resolvedToday: number;
-    avgBrierScore: number;
+    /** null means "no resolved markets to score yet" — distinct from a genuine
+     *  0.0, which would be perfect calibration. */
+    avgBrierScore: number | null;
     bestPrediction: string;
     worstPrediction: string;
   };

@@ -36,41 +36,101 @@
  * step share the same "currently active key" decision.
  */
 
-import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { SignalAgent } from "../src/prediction/signal-agent.ts";
 import { BrainAgent } from "../src/prediction/brain-agent.ts";
 import { AnalystAgent } from "../src/prediction/analyst-agent.ts";
+import { ExecutionAgent } from "../src/prediction/execution-agent.ts";
+import { extractCrowdProbability } from "../src/prediction/crowd.ts";
+import { formatProbability } from "../src/prediction/format.ts";
 import type { PredictionSignal, PredictionMarket, SignalSource } from "../src/prediction/types.ts";
-import { loadKeyPool, isKeyExhaustedError } from "./lib/gemini-keys.ts";
+import { loadKeyPool, FREE_TIER_DAILY_REQUESTS } from "./lib/gemini-keys.ts";
+import { createLlmCall, formatUsage, DEFAULT_GEMINI_MODEL } from "./lib/llm.ts";
+import { brainQuery, brainWrite as brainWriteRaw } from "./lib/brain-cli.ts";
 import { sendTelegram } from "./lib/telegram.ts";
+import { loadState, saveState } from "./lib/market-store.ts";
+import { acquireLockOrExit, PIPELINE_LOCK } from "./lib/run-lock.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 // gemini-2.0-flash / -lite return free-tier limit=0 on this project; 2.5-flash
 // has a working free-tier chat quota (verified empirically — see PR discussion).
-const GEMINI_MODEL = "gemini-2.5-flash";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const GEMINI_MODEL = DEFAULT_GEMINI_MODEL;
 
 // ---------------------------------------------------------------------
 // CLI flags
 // ---------------------------------------------------------------------
 function flag(name: string, fallback?: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
-  return i >= 0 ? process.argv[i + 1] : fallback;
+  if (i < 0) return fallback;
+  const value = process.argv[i + 1];
+  // `--max-signals` with nothing after it, or followed by the next flag, used
+  // to yield undefined -> Number(undefined) -> NaN. NaN then made
+  // `slice(0, NaN)` return zero signals and `overall < NaN` always false, i.e.
+  // every signal accepted. Both failures were silent.
+  if (value === undefined || value.startsWith("--")) {
+    console.error(`[run-prediction-cycle] --${name} requires a value`);
+    process.exit(2);
+  }
+  return value;
 }
+
+function numericFlag(name: string, fallback: number, min: number, max: number): number {
+  const raw = flag(name, String(fallback))!;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    console.error(
+      `[run-prediction-cycle] --${name} must be a number in [${min}, ${max}], got "${raw}"`,
+    );
+    process.exit(2);
+  }
+  return n;
+}
+
 const DRY_RUN = process.argv.includes("--dry-run");
 // Free-tier Gemini quota is GenerateRequestsPerDayPerProjectPerModel = 20/day
-// for gemini-2.5-flash (verified empirically). Each evaluated signal costs
-// 2 calls (quality + estimate); the daily report costs 1 more. Default of 4
-// signals/cycle = 9 calls/cycle, leaving headroom for 2 cycles/day (18/20)
-// plus a little slack. Raise this once billing is enabled on the project.
-const MAX_SIGNALS = Number(flag("max-signals", "4"));
-const QUALITY_THRESHOLD = Number(flag("quality-threshold", "55"));
+// per key for gemini-2.5-flash. Each evaluated signal costs 2 calls (quality +
+// estimate); the daily report and the translation cost 1 each. Keep
+// --max-signals in run-analytics-cycle.ps1 in step with the number of keys in
+// the pool, or the pool burns out mid-cycle.
+const MAX_SIGNALS = numericFlag("max-signals", 4, 1, 200);
+const QUALITY_THRESHOLD = numericFlag("quality-threshold", 55, 0, 100);
 const SOURCES = (flag("sources", "polymarket,kalshi") ?? "polymarket,kalshi")
   .split(",")
-  .map((s) => s.trim()) as SignalSource[];
+  .map((s) => s.trim())
+  .filter(Boolean) as SignalSource[];
+
+if (SOURCES.length === 0) {
+  console.error("[run-prediction-cycle] --sources resolved to an empty list");
+  process.exit(2);
+}
+
+// Reject a misspelled source outright. Previously an unknown name fell through
+// the fetcher switch and returned an empty array, so "alpha_vantage" (the real
+// name has no underscore) looked identical to a source that simply had no news.
+const KNOWN_SOURCES: ReadonlySet<string> = new Set<SignalSource>([
+  "x_twitter", "news", "onchain", "polymarket", "kalshi", "predictit", "reddit",
+  "discord", "manual", "defillama", "rss", "binance", "bybit", "coingecko",
+  "gdelt", "telegram", "fred", "alphavantage", "dune", "farcaster",
+]);
+const unknownSources = SOURCES.filter((s) => !KNOWN_SOURCES.has(s));
+if (unknownSources.length > 0) {
+  console.error(
+    `[run-prediction-cycle] unknown source(s): ${unknownSources.join(", ")}\n` +
+      `  valid: ${[...KNOWN_SOURCES].sort().join(", ")}`,
+  );
+  process.exit(2);
+}
+
+// Each accepted signal costs 2 calls (quality + estimate), plus one report and
+// one translation per cycle. The capacity check needs the key pool, so it runs
+// once the pool is loaded, below.
+const estimatedCalls = MAX_SIGNALS * 2 + 2;
+console.log(
+  `[run-prediction-cycle] budget: up to ~${estimatedCalls} Gemini call(s) this cycle ` +
+    `(${MAX_SIGNALS} signals x2 + report + translation)`,
+);
 
 // ---------------------------------------------------------------------
 // Multi-account key pool (scripts/lib/gemini-keys.ts). Rotates to the next
@@ -79,138 +139,35 @@ const SOURCES = (flag("sources", "polymarket,kalshi") ?? "polymarket,kalshi")
 // dream` step in run-analytics-cycle.ps1) pick up where this left off.
 // ---------------------------------------------------------------------
 const keyPool = loadKeyPool();
-console.log(`[run-prediction-cycle] key pool: ${keyPool.size()} key(s), starting at #${keyPool.activeIndex() + 1}`);
+console.log(
+  `[run-prediction-cycle] key pool: ${keyPool.size()} key(s) ` +
+    `(${keyPool.freeCount()} free, ${keyPool.paidCount()} paid reserve), starting on ${keyPool.activeLabel()}`,
+);
 
-// ---------------------------------------------------------------------
-// Gemini-backed llmCall with 429/503 backoff + cross-key rotation + fence
-// stripping
-// ---------------------------------------------------------------------
-function stripFences(text: string): string {
-  const m = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  return m ? m[1] : text;
-}
-
-async function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-let lastCallAt = 0;
-const MIN_GAP_MS = 15_000; // poor-man's rate limiter — gemini-2.5-flash free tier RPM is tight
-
-async function llmCall(
-  system: string,
-  prompt: string,
-  _opts?: { model?: string },
-): Promise<string> {
-  const body = JSON.stringify({
-    systemInstruction: { parts: [{ text: system }] },
-    contents: [{ parts: [{ text: prompt }] }],
-  });
-
-  // Outer loop: cross-key rotation. Inner loop: same-key retry for
-  // transient (non-exhaustion) errors.
-  for (;;) {
-    const key = keyPool.current();
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const gap = Date.now() - lastCallAt;
-      if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
-      lastCallAt = Date.now();
-
-      let res: Response;
-      try {
-        res = await fetch(GEMINI_URL, {
-          method: "POST",
-          headers: { "x-goog-api-key": key, "Content-Type": "application/json" },
-          body,
-        });
-      } catch (err) {
-        if (attempt === 3) throw err;
-        await sleep(5_000 * attempt);
-        continue;
-      }
-
-      if (res.ok) {
-        const json = (await res.json()) as {
-          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-        };
-        const text = json.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-        return stripFences(text);
-      }
-
-      const bodyText = await res.text().catch(() => "");
-
-      if (isKeyExhaustedError(res.status, bodyText)) {
-        const nextKey = keyPool.rotate(`HTTP ${res.status}: ${bodyText.slice(0, 150)}`);
-        if (nextKey === null) {
-          throw new Error(
-            `All ${keyPool.size()} Gemini key(s) exhausted. Last error: ${bodyText.slice(0, 300)}`,
-          );
-        }
-        break; // restart outer loop with the new key
-      }
-
-      if (res.status === 503 || res.status === 504) {
-        if (attempt === 3) {
-          throw new Error(`Gemini HTTP ${res.status} (transient, exhausted retries): ${bodyText.slice(0, 300)}`);
-        }
-        const backoff = 8_000 * attempt;
-        console.error(`[llmCall] ${res.status} (transient), retrying same key in ${backoff}ms (attempt ${attempt}/3)`);
-        await sleep(backoff);
-        continue;
-      }
-
-      throw new Error(`Gemini HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
-    }
-  }
+// Capacity is counted over FREE keys only. A paid key is bounded by spend, not
+// by a request-per-day quota, so folding it into this number would invent a
+// limit nobody knows — it is the overflow that keeps a cycle from dying, and
+// the warning says exactly that.
+const freeCapacity = keyPool.freeCount() * FREE_TIER_DAILY_REQUESTS;
+if (estimatedCalls > freeCapacity) {
+  console.warn(
+    `[run-prediction-cycle] WARNING: ~${estimatedCalls} calls exceeds the free-tier capacity of ` +
+      `${freeCapacity} (${keyPool.freeCount()} key(s) x ${FREE_TIER_DAILY_REQUESTS}/day)` +
+      (keyPool.paidCount() > 0
+        ? "; the overflow will bill to the paid reserve key."
+        : "; the pool will exhaust mid-cycle."),
+  );
 }
 
 // ---------------------------------------------------------------------
-// brainQuery / brainWrite — shell out to the real inbrain CLI so writes
-// go through actual chunking/embedding/link-extraction, not a bypass.
+// Gemini call path + brain CLI bridge now live in scripts/lib/ � they used to
+// be copy-pasted into this file and run-dream-cycle.ts, and had already
+// drifted apart.
 // ---------------------------------------------------------------------
-// Each `inbrain` invocation is a fresh process: PGLite cold-start + config
-// load + (for put) an embedding round-trip, easily 30-60s on this machine.
-// 30s timeouts caused real ETIMEDOUT failures in production (2026-06-16
-// 16:15 run lost 2/4 market pages). 90s + one retry covers cold start with
-// headroom while still failing fast if `inbrain` is genuinely stuck.
-const CLI_TIMEOUT_MS = 90_000;
+const llmCall = createLlmCall(keyPool, { model: GEMINI_MODEL });
 
-async function brainQuery(query: string): Promise<string> {
-  try {
-    return execFileSync(
-      "inbrain",
-      ["query", query, "--no-expand", "--limit", "5"],
-      { cwd: REPO_ROOT, encoding: "utf-8", timeout: CLI_TIMEOUT_MS, env: process.env },
-    );
-  } catch (err) {
-    return `Brain query failed (non-fatal): ${(err as Error).message.slice(0, 200)}`;
-  }
-}
-
-async function brainWrite(slug: string, content: string): Promise<void> {
-  if (DRY_RUN) {
-    console.log(`[dry-run] would write page "${slug}" (${content.length} chars)`);
-    return;
-  }
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      execFileSync("inbrain", ["put", slug], {
-        cwd: REPO_ROOT,
-        input: content,
-        encoding: "utf-8",
-        timeout: CLI_TIMEOUT_MS,
-        env: process.env,
-      });
-      return;
-    } catch (err) {
-      if (attempt === 2) {
-        console.error(`[brainWrite] failed for "${slug}" after ${attempt} attempts: ${(err as Error).message.slice(0, 300)}`);
-      } else {
-        console.error(`[brainWrite] attempt ${attempt} failed for "${slug}", retrying: ${(err as Error).message.slice(0, 150)}`);
-      }
-    }
-  }
+async function brainWrite(slug: string, content: string): Promise<boolean> {
+  return brainWriteRaw(slug, content, { dryRun: DRY_RUN });
 }
 
 // ---------------------------------------------------------------------
@@ -218,56 +175,37 @@ async function brainWrite(slug: string, content: string): Promise<void> {
 // its public start()/stop() — start() awaits exactly one poll cycle
 // before arming the interval, which we then cancel immediately).
 // ---------------------------------------------------------------------
-async function collectSignals(): Promise<PredictionSignal[]> {
+async function collectSignals(
+  seenSignalIds: string[],
+): Promise<{ signals: PredictionSignal[]; seenIds: string[] }> {
   const collected: PredictionSignal[] = [];
   const agent = new SignalAgent({
     sources: SOURCES,
     maxSignalsPerCycle: MAX_SIGNALS,
+    seenSignalIds,
     onSignal: (signal) => {
       collected.push(signal);
     },
   });
-  await agent.start(); // awaits exactly one poll() cycle
-  agent.stop(); // cancel the interval before it fires again
-  return collected;
+  try {
+    await agent.start(); // awaits exactly one poll() cycle
+  } finally {
+    agent.stop(); // cancel the interval before it fires again
+  }
+  return { signals: collected, seenIds: agent.seenIds() };
 }
 
-// ---------------------------------------------------------------------
-// Crowd-price extraction (AnalystAgent.discoverAlpha exists in the library
-// but isn't wired into this cycle — this is the lightweight version:
-// extract the crowd's own implied probability from the raw signal so the
-// report can show AI-vs-crowd divergence directly, instead of needing a
-// manual side-by-side lookup after the fact).
+// Crowd-price extraction moved to src/prediction/crowd.ts so the Brain Agent
+// and this report use one implementation (and one set of units).
+
+// Divergence worth calling out, in percentage points.
 //
-//   - Polymarket: rawData.outcomePrices is a JSON-ENCODED STRING (verified
-//     against the live API 2026-06-16 — gamma-api literally returns
-//     `"outcomePrices":"[\"0.0965\", \"0.9035\"]"`, a string, not an array),
-//     where index 0 is the YES price = the crowd-implied probability.
-//   - Kalshi: rawData.yesAsk is a 0-100 cents value; /100 gives probability.
-// ---------------------------------------------------------------------
-function extractCrowdProbability(signal: PredictionSignal): number | undefined {
-  const raw = signal.rawData;
-  if (!raw) return undefined;
-  if (signal.source === "polymarket" && typeof raw.outcomePrices === "string") {
-    try {
-      const arr = JSON.parse(raw.outcomePrices) as string[];
-      const yes = parseFloat(arr[0]);
-      return Number.isFinite(yes) ? yes : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-  if (signal.source === "kalshi" && typeof raw.yesAsk === "number") {
-    return raw.yesAsk / 100;
-  }
-  return undefined;
-}
-
-// Flag a divergence as worth calling out once it's at least this many
-// percentage points — these markets run small (sub-10% YES is typical for
-// long-shot futures), so even a few points is meaningful, but noise in a
-// single LLM probability call shouldn't read as "found alpha".
-const ALPHA_DIVERGENCE_THRESHOLD_PP = 3;
+// This was 3pp, which flagged literally every row in every shipped report —
+// including rows whose "crowd" number came from the outcome-index bug. An LLM
+// probability carries several points of noise on its own, so a threshold below
+// that noise floor is not a signal, it is decoration. 20pp is roughly the point
+// where a disagreement is larger than the model's own run-to-run spread.
+const ALPHA_DIVERGENCE_THRESHOLD_PP = 20;
 
 interface MarketWithCrowd {
   market: PredictionMarket;
@@ -304,11 +242,15 @@ function formatCrowdComparison(items: MarketWithCrowd[]): string[] {
 // Markdown formatting for the brain page (mirrors AnalystAgent's private
 // formatDailyReport shape since that method isn't exported).
 // ---------------------------------------------------------------------
-// The prompt doesn't pin down whether "probability" is 0-1 or 0-100, and
-// Gemini has returned both shapes across runs. Treat anything > 1 as
-// already-a-percentage instead of multiplying it into nonsense like "1800%".
-function asPercent(value: number): number {
-  return Math.round(value > 1 ? value : value * 100);
+// analyst-agent prompt now pins probability to 0-1 scale. As a safety net for
+// any residual integer-percentage response from the LLM (e.g. 18 for 18%),
+// treat values >= 2 as already-percentages. Value 1 is unambiguously 1.0 = 100%
+// in the 0-1 scale — Gemini no longer returns bare "1" to mean "1%".
+// Rendering goes through formatProbability so a long-shot market keeps its
+// real number: Math.round printed 0.001 as "0%", and a market the report calls
+// impossible is precisely the one an alpha section exists to surface.
+function asPercent(value: number): string {
+  return formatProbability(value >= 2 ? value / 100 : value);
 }
 
 function formatReportMarkdown(
@@ -349,14 +291,19 @@ function formatReportMarkdown(
   if (report.trends.length) {
     lines.push("## Trends");
     for (const t of report.trends.slice(0, 5)) {
-      lines.push(`- ${t.topic} (${t.direction}, confidence ${Math.round(t.confidence * 100)}%): ${t.prediction}`);
+      lines.push(`- ${t.topic} (${t.direction}, confidence ${formatProbability(t.confidence)}%): ${t.prediction}`);
     }
     lines.push("");
   }
   lines.push("## Performance Metrics");
   lines.push(`- Total active: ${report.performanceMetrics.totalActive}`);
   lines.push(`- Resolved today: ${report.performanceMetrics.resolvedToday}`);
-  lines.push(`- Avg Brier score: ${report.performanceMetrics.avgBrierScore}`);
+  // Say "no data" in words. Printing the literal `null` (or, before that, a
+  // hallucinated 0) reads as "our calibration is perfect / catastrophic".
+  const brier = report.performanceMetrics.avgBrierScore;
+  lines.push(
+    `- Avg Brier score: ${brier === null ? "n/a — no resolved markets yet" : brier.toFixed(4)}`,
+  );
   return lines.join("\n");
 }
 
@@ -408,15 +355,28 @@ async function saveReportFile(reportMd: string, startedAt: Date, ruMd: string): 
 // Main
 // ---------------------------------------------------------------------
 async function main(): Promise<void> {
+  // Taken before anything is read. The state file is loaded here and rewritten
+  // whole at the end, so an overlapping run would load a pre-write copy and
+  // erase whatever this run adds — and both would draw on the same daily API
+  // quota. Held for the whole cycle, including the dream cycle, which reads the
+  // same file.
+  acquireLockOrExit(PIPELINE_LOCK);
+
   const startedAt = new Date();
   console.log(`[run-prediction-cycle] starting — sources=${SOURCES.join(",")} max=${MAX_SIGNALS} threshold=${QUALITY_THRESHOLD} dry-run=${DRY_RUN}`);
 
-  const signals = await collectSignals();
-  console.log(`[run-prediction-cycle] collected ${signals.length} signal(s)`);
+  // Carried over from previous runs. Without it every run started from nothing:
+  // the same markets were re-evaluated and paid for daily, and nothing ever
+  // reached a resolved state for the calibration loop to learn from.
+  const state = loadState();
+  console.log(
+    `[run-prediction-cycle] state: ${state.activeMarkets.length} active, ` +
+      `${state.resolvedMarkets.length} resolved, ${state.seenSignalIds.length} seen signal id(s)`,
+  );
 
-  // Capture crowd-implied probability per signal BEFORE evaluation (the
-  // BrainAgent doesn't carry rawData through to PredictionMarket, so this
-  // has to be looked up from the original signal afterward).
+  const { signals, seenIds } = await collectSignals(state.seenSignalIds);
+  console.log(`[run-prediction-cycle] collected ${signals.length} new signal(s)`);
+
   const crowdBySignalId = new Map<string, number>();
   for (const signal of signals) {
     const crowd = extractCrowdProbability(signal);
@@ -427,46 +387,122 @@ async function main(): Promise<void> {
     qualityThreshold: QUALITY_THRESHOLD,
     modelId: GEMINI_MODEL,
     brainQuery,
-    brainWrite: DRY_RUN ? async () => {} : brainWrite,
+    brainWrite: async (slug, content) => {
+      await brainWrite(slug, content);
+    },
     llmCall,
   });
 
-  const markets: PredictionMarket[] = [];
+  const newMarkets: PredictionMarket[] = [];
   let rejected = 0;
+  let skipped = 0;
   for (const signal of signals) {
-    const result = await brainAgent.evaluate(signal);
-    if (result.accepted) {
-      markets.push(result.market);
-    } else {
-      rejected++;
+    try {
+      const result = await brainAgent.evaluate(signal);
+      if (result.accepted) {
+        newMarkets.push(result.market);
+      } else {
+        rejected++;
+      }
+    } catch (err) {
+      // Transient overload or network error on a single signal — skip it rather
+      // than aborting the cycle. The report covers the signals that succeeded.
+      skipped++;
+      console.error(`[run-prediction-cycle] skipped signal ${signal.id} (${(err as Error).message.slice(0, 120)})`);
     }
   }
-  console.log(`[run-prediction-cycle] ${markets.length} accepted, ${rejected} rejected`);
+  console.log(`[run-prediction-cycle] ${newMarkets.length} accepted, ${rejected} rejected, ${skipped} skipped (API error)`);
 
-  const marketsWithCrowd: MarketWithCrowd[] = markets.map((market) => ({
+  // --- Market lifecycle -------------------------------------------------
+  // ExecutionAgent shipped as library code that no runner ever imported, so
+  // no market was ever monitored, expired, or resolved — which is also why
+  // Brier scoring and the meta-model had nothing to work with.
+  const execution = new ExecutionAgent({
+    brainQuery,
+    brainWrite: async (slug, content) => {
+      await brainWrite(slug, content);
+    },
+    llmCall,
+    onMarketResolved: (market) => {
+      state.resolvedMarkets.push(market);
+    },
+  });
+  for (const market of [...state.activeMarkets, ...newMarkets]) {
+    execution.addMarket(market);
+  }
+  try {
+    await execution.runMonitorCycle();
+  } catch (err) {
+    console.error(`[run-prediction-cycle] monitor cycle failed: ${(err as Error).message}`);
+  }
+  const stillActive = execution.getActiveMarkets();
+  console.log(
+    `[run-prediction-cycle] lifecycle: ${stillActive.length} active, ${state.resolvedMarkets.length} resolved to date`,
+  );
+
+  const marketsWithCrowd: MarketWithCrowd[] = newMarkets.map((market) => ({
     market,
     crowdProb: crowdBySignalId.get(market.sourceSignals[0] ?? ""),
   }));
 
   const analyst = new AnalystAgent({ brainQuery, llmCall });
-  const report = await analyst.generateDailyReport(markets);
+  // Pass resolved markets too — the report's Brier score is computed from them.
+  const report = await analyst.generateDailyReport([...stillActive, ...state.resolvedMarkets]);
   const reportMd = formatReportMarkdown(report, marketsWithCrowd);
 
   console.log("\n" + reportMd + "\n");
 
+  // Durable outputs first. Telegram used to run before the brain write and was
+  // not wrapped, so a single 400/429 from the Bot API aborted main() and the
+  // report was lost even though it had already been generated and translated.
+  const slug = reportSlug(startedAt);
+  const written = await brainWrite(slug, reportMd);
+  if (DRY_RUN) {
+    console.log(`[run-prediction-cycle] dry run — brain page not written: ${slug}`);
+  } else {
+    console.log(
+      written
+        ? `[run-prediction-cycle] report written to brain page: ${slug}`
+        : `[run-prediction-cycle] report NOT written to brain (see errors above): ${slug}`,
+    );
+  }
+
   const ruTranslation = await translateToRussian(reportMd);
   await saveReportFile(reportMd, startedAt, ruTranslation);
 
-  const telegramText = ruTranslation || reportMd;
-  const sent = await sendTelegram(telegramText, { envPath: join(REPO_ROOT, ".env") });
-  if (sent) console.log("[telegram] report sent");
+  if (!DRY_RUN) {
+    saveState({
+      activeMarkets: stillActive,
+      resolvedMarkets: state.resolvedMarkets,
+      seenSignalIds: seenIds,
+    });
+  }
 
-  const slug = `predictions/reports/${startedAt.toISOString().slice(0, 10)}-${String(startedAt.getHours()).padStart(2, "0")}${String(startedAt.getMinutes()).padStart(2, "0")}`;
-  await brainWrite(slug, reportMd);
-  console.log(`[run-prediction-cycle] report written to brain page: ${slug}`);
+  // Last, and never fatal. A dry run must not publish to a real channel —
+  // --dry-run gated the brain write but still broadcast to Telegram.
+  if (DRY_RUN) {
+    console.log("[telegram] dry run — not sending");
+  } else {
+    try {
+      const sent = await sendTelegram(ruTranslation || reportMd, { envPath: join(REPO_ROOT, ".env") });
+      if (sent) console.log("[telegram] report sent");
+    } catch (err) {
+      console.error(`[telegram] send failed (report already persisted): ${(err as Error).message.slice(0, 200)}`);
+    }
+  }
 
   const elapsedSec = Math.round((Date.now() - startedAt.getTime()) / 1000);
+  console.log(`[run-prediction-cycle] gemini usage: ${formatUsage(llmCall.usage())}`);
   console.log(`[run-prediction-cycle] done in ${elapsedSec}s`);
+}
+
+/** Slug for the report page. Built entirely from local time — mixing
+ *  toISOString() (UTC) with getHours() (local) filed a 00:54 run under the
+ *  previous day. */
+function reportSlug(at: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const date = `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+  return `predictions/reports/${date}-${pad(at.getHours())}${pad(at.getMinutes())}`;
 }
 
 main().catch((err) => {
