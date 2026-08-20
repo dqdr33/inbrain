@@ -16,6 +16,12 @@ export interface PredictionSignal {
   engagement?: EngagementMetrics;
   entities: string[];
   sentiment?: number; // -1 to 1
+  /** The venue's own close date, where the source has one (polymarket, kalshi,
+   *  predictit). Typed rather than left in `rawData` because it decides the
+   *  market's expiry — see src/prediction/deadline.ts. Absent for the sources
+   *  with no deadline concept (telegram, rss, news, …), which fall back to the
+   *  deadline written in the title. */
+  deadline?: Date;
   rawData?: Record<string, unknown>;
 }
 
@@ -28,7 +34,18 @@ export type SignalSource =
   | "predictit"
   | "reddit"
   | "discord"
-  | "manual";
+  | "manual"
+  | "defillama"
+  | "rss"
+  | "binance"
+  | "bybit"
+  | "coingecko"
+  | "gdelt"
+  | "telegram"
+  | "fred"
+  | "alphavantage"
+  | "dune"
+  | "farcaster";
 
 export interface EngagementMetrics {
   likes: number;
@@ -108,6 +125,33 @@ export interface AIEstimate {
   modelVersion: string;
   updatedAt: Date;
   historicalAccuracy?: number;
+  /** Model's expected horizon to resolution, 1-365 days. Drives expiresAt.
+   *  Used to live only on an `as any` cast, so nothing validated its range. */
+  estimatedResolutionDays?: number;
+
+  /**
+   * The model's own output, before the calibration layer and the price shrink.
+   *
+   * THE ONLY FIELD A CALIBRATION FIT MAY EVER TRAIN ON. If a fit learns from
+   * `yesProbability` after a correction has been applied to it, the correction
+   * compounds every night — 0.55 becomes 0.45, the next fit sees 0.45 as still
+   * miscalibrated and pushes it to 0.38, and so on until every forecast has
+   * collapsed to the base rate. The system would look like it was learning while
+   * destroying the sharpness that makes it worth anything.
+   *
+   * Same problem and same solution as `metadata.preMonotonicProbability` in
+   * monotonic.ts.
+   */
+  rawYesProbability?: number;
+
+  /** What the calibration layer did, so the adjustment stays auditable. */
+  calibration?: {
+    method: "identity" | "platt" | "isotonic";
+    fittedAt: string;
+    /** After the fitted mapping, before shrinking toward the venue price. */
+    afterCalibration: number;
+    priceShrinkApplied: boolean;
+  };
 }
 
 export interface MarketResolution {
@@ -124,7 +168,8 @@ export interface DreamCycleReport {
   duration: number;
 
   marketsReviewed: number;
-  predictionsAccuracy: number;
+  /** null when nothing has resolved yet — distinct from a genuine 0.0. */
+  predictionsAccuracy: number | null;
   knowledgeGapsFound: string[];
   knowledgeGapsFilled: string[];
 

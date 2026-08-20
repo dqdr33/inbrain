@@ -41,19 +41,30 @@ import { join } from "node:path";
 
 import { SignalAgent } from "../src/prediction/signal-agent.ts";
 import { BrainAgent } from "../src/prediction/brain-agent.ts";
-import { AnalystAgent } from "../src/prediction/analyst-agent.ts";
+import { AnalystAgent, maxEstimateAgeFor } from "../src/prediction/analyst-agent.ts";
 import { ExecutionAgent } from "../src/prediction/execution-agent.ts";
-import { extractCrowdProbability } from "../src/prediction/crowd.ts";
-import { formatProbability } from "../src/prediction/format.ts";
+import { extractCrowdQuote } from "../src/prediction/crowd.ts";
+import { isLive } from "../src/prediction/deadline.ts";
+import { findStructuralDesyncs, relatedMarketIds } from "../src/prediction/cross-market.ts";
+import { normalizeRelatedMarkets } from "../src/prediction/normalize.ts";
+import { enforceMonotonicity } from "../src/prediction/monotonic.ts";
 import type { PredictionSignal, PredictionMarket, SignalSource } from "../src/prediction/types.ts";
+import { formatReportMarkdown } from "./lib/report-format.ts";
+import { refreshQuotes } from "./lib/quote-refresh.ts";
+import { fetchVenueResolution as fetchVenueOutcome } from "./lib/venue-settle.ts";
 import { loadKeyPool, FREE_TIER_DAILY_REQUESTS } from "./lib/gemini-keys.ts";
 import { createLlmCall, formatUsage, DEFAULT_GEMINI_MODEL } from "./lib/llm.ts";
-import { brainQuery, brainWrite as brainWriteRaw } from "./lib/brain-cli.ts";
+import { brainGet, brainQuery, brainWrite as brainWriteRaw } from "./lib/brain-cli.ts";
+import { loadCalibrationFit } from "./lib/calibration-store.ts";
 import { sendTelegram } from "./lib/telegram.ts";
-import { loadState, saveState } from "./lib/market-store.ts";
+import { loadState, saveState, deduplicateMarkets } from "./lib/market-store.ts";
 import { acquireLockOrExit, PIPELINE_LOCK } from "./lib/run-lock.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
+
+/** Stale estimates refreshed per cycle. One LLM call each, so this is bounded
+ *  by the same free-tier budget as the signal evaluations above it. */
+const MAX_REFRESH_PER_CYCLE = 6;
 // gemini-2.0-flash / -lite return free-tier limit=0 on this project; 2.5-flash
 // has a working free-tier chat quota (verified empirically — see PR discussion).
 const GEMINI_MODEL = DEFAULT_GEMINI_MODEL;
@@ -96,7 +107,29 @@ const DRY_RUN = process.argv.includes("--dry-run");
 // the pool, or the pool burns out mid-cycle.
 const MAX_SIGNALS = numericFlag("max-signals", 4, 1, 200);
 const QUALITY_THRESHOLD = numericFlag("quality-threshold", 55, 0, 100);
-const SOURCES = (flag("sources", "polymarket,kalshi") ?? "polymarket,kalshi")
+const DEFAULT_SOURCES = [
+  "polymarket",
+  "kalshi",
+  "predictit",
+  "news",
+  "telegram",
+  "rss",
+  "defillama",
+  "binance",
+  "bybit",
+  "coingecko",
+  "fred",
+  "onchain",
+  "reddit",
+  "discord",
+  "x_twitter",
+  "gdelt",
+  "alphavantage",
+  "dune",
+  "farcaster",
+].join(",");
+
+const SOURCES = (flag("sources", DEFAULT_SOURCES) ?? DEFAULT_SOURCES)
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean) as SignalSource[];
@@ -196,116 +229,9 @@ async function collectSignals(
 }
 
 // Crowd-price extraction moved to src/prediction/crowd.ts so the Brain Agent
-// and this report use one implementation (and one set of units).
-
-// Divergence worth calling out, in percentage points.
-//
-// This was 3pp, which flagged literally every row in every shipped report —
-// including rows whose "crowd" number came from the outcome-index bug. An LLM
-// probability carries several points of noise on its own, so a threshold below
-// that noise floor is not a signal, it is decoration. 20pp is roughly the point
-// where a disagreement is larger than the model's own run-to-run spread.
-const ALPHA_DIVERGENCE_THRESHOLD_PP = 20;
-
-interface MarketWithCrowd {
-  market: PredictionMarket;
-  crowdProb?: number;
-}
-
-function formatCrowdComparison(items: MarketWithCrowd[]): string[] {
-  const withCrowd = items.filter((i) => i.crowdProb !== undefined);
-  if (withCrowd.length === 0) return [];
-
-  const lines = ["## AI vs Crowd", ""];
-  // Sort by absolute divergence, biggest first — the interesting rows lead.
-  const rows = withCrowd
-    .map(({ market, crowdProb }) => {
-      const aiPct = market.aiEstimate.yesProbability * 100;
-      const crowdPct = crowdProb! * 100;
-      const diffPp = aiPct - crowdPct;
-      return { market, aiPct, crowdPct, diffPp };
-    })
-    .sort((a, b) => Math.abs(b.diffPp) - Math.abs(a.diffPp));
-
-  for (const r of rows) {
-    const sign = r.diffPp >= 0 ? "+" : "";
-    const flag = Math.abs(r.diffPp) >= ALPHA_DIVERGENCE_THRESHOLD_PP ? " ⚠ notable divergence" : "";
-    lines.push(
-      `- ${r.market.title} — AI ${r.aiPct.toFixed(1)}% vs Crowd ${r.crowdPct.toFixed(1)}% (${sign}${r.diffPp.toFixed(1)}pp)${flag}`,
-    );
-  }
-  lines.push("");
-  return lines;
-}
-
-// ---------------------------------------------------------------------
-// Markdown formatting for the brain page (mirrors AnalystAgent's private
-// formatDailyReport shape since that method isn't exported).
-// ---------------------------------------------------------------------
-// analyst-agent prompt now pins probability to 0-1 scale. As a safety net for
-// any residual integer-percentage response from the LLM (e.g. 18 for 18%),
-// treat values >= 2 as already-percentages. Value 1 is unambiguously 1.0 = 100%
-// in the 0-1 scale — Gemini no longer returns bare "1" to mean "1%".
-// Rendering goes through formatProbability so a long-shot market keeps its
-// real number: Math.round printed 0.001 as "0%", and a market the report calls
-// impossible is precisely the one an alpha section exists to surface.
-function asPercent(value: number): string {
-  return formatProbability(value >= 2 ? value / 100 : value);
-}
-
-function formatReportMarkdown(
-  report: Awaited<ReturnType<AnalystAgent["generateDailyReport"]>>,
-  marketsWithCrowd: MarketWithCrowd[],
-): string {
-  const dateStr = report.date.toISOString().slice(0, 10);
-  const lines = [
-    "---",
-    "type: prediction-daily-report",
-    `date: ${dateStr}`,
-    `active_markets: ${report.activeMarkets}`,
-    `resolved_today: ${report.resolvedMarkets}`,
-    "---",
-    "",
-    `# Inbrain Daily Intelligence — ${dateStr}`,
-    "",
-    report.summary,
-    "",
-    `**Active Markets:** ${report.activeMarkets}  |  **Resolved Today:** ${report.resolvedMarkets}`,
-    "",
-  ];
-  if (report.topMarkets.length) {
-    lines.push("## Top Markets");
-    for (const m of report.topMarkets.slice(0, 5)) {
-      lines.push(`- ${m.title} — ${asPercent(m.probability)}% YES (${m.trend})`);
-    }
-    lines.push("");
-  }
-  lines.push(...formatCrowdComparison(marketsWithCrowd));
-  if (report.alphaOpportunities.length) {
-    lines.push("## Alpha Opportunities");
-    for (const a of report.alphaOpportunities.slice(0, 5)) {
-      lines.push(`- [${a.urgency.toUpperCase()}] ${a.title} — ${a.reasoning}`);
-    }
-    lines.push("");
-  }
-  if (report.trends.length) {
-    lines.push("## Trends");
-    for (const t of report.trends.slice(0, 5)) {
-      lines.push(`- ${t.topic} (${t.direction}, confidence ${formatProbability(t.confidence)}%): ${t.prediction}`);
-    }
-    lines.push("");
-  }
-  lines.push("## Performance Metrics");
-  lines.push(`- Total active: ${report.performanceMetrics.totalActive}`);
-  lines.push(`- Resolved today: ${report.performanceMetrics.resolvedToday}`);
-  // Say "no data" in words. Printing the literal `null` (or, before that, a
-  // hallucinated 0) reads as "our calibration is perfect / catastrophic".
-  const brier = report.performanceMetrics.avgBrierScore;
-  lines.push(
-    `- Avg Brier score: ${brier === null ? "n/a — no resolved markets yet" : brier.toFixed(4)}`,
-  );
-  return lines.join("\n");
-}
+// and this report use one implementation (and one set of units). Markdown
+// rendering moved to scripts/lib/report-format.ts so it can be imported and
+// tested without running a pipeline cycle.
 
 // ---------------------------------------------------------------------
 // Report file output — saves bilingual .md to Report/YYYY-MM-DD_HHMM.md
@@ -315,9 +241,16 @@ const REPORT_DIR = join(REPO_ROOT, "Report");
 async function translateToRussian(englishMd: string): Promise<string> {
   try {
     return await llmCall(
-      "You are a professional translator. Translate the following Markdown report from English to Russian. " +
-        "Preserve all Markdown formatting (headers, lists, bold, frontmatter). " +
-        "Translate all text content but keep slugs, numbers, percentages, and YAML keys as-is.",
+      "Переведи этот отчёт с английского на русский, сохранив разметку Markdown " +
+        "(заголовки, списки, жирный шрифт, frontmatter). Числа, проценты,slug'и и " +
+        "ключи YAML оставь как есть. Части, уже написанные по-русски, не трогай.\n\n" +
+        "ГЛАВНОЕ — пиши живым человеческим языком, как объясняют знакомому, а не " +
+        "биржевому аналитику. Никакого жаргона: не используй слова «альфа», " +
+        "«дивергенция», «п.п.» вместо «процентных пунктов», «арбитраж», «стакан», " +
+        "«ордербук», «конвикция», «недооценённость». Вместо «наш ИИ оценивает» пиши «мы " +
+        "считаем»; вместо «рыночная цена составляет» — «рынок считает». " +
+        "Короткие фразы. Если фразу нельзя понять без финансового словаря — " +
+        "перепиши её проще.",
       englishMd,
     );
   } catch (err) {
@@ -377,20 +310,33 @@ async function main(): Promise<void> {
   const { signals, seenIds } = await collectSignals(state.seenSignalIds);
   console.log(`[run-prediction-cycle] collected ${signals.length} new signal(s)`);
 
-  const crowdBySignalId = new Map<string, number>();
-  for (const signal of signals) {
-    const crowd = extractCrowdProbability(signal);
-    if (crowd !== undefined) crowdBySignalId.set(signal.id, crowd);
-  }
+  const quoted = signals.filter((s) => extractCrowdQuote(s) !== undefined).length;
+  console.log(`[run-prediction-cycle] ${quoted} signal(s) carry a crowd quote`);
+
+  // The mapping the nightly dream cycle fitted from venue-confirmed outcomes.
+  // Identity when there is not enough honest history yet, which is the common
+  // case and the correct default — see calibration-fit.ts for why the guards
+  // are biased that hard toward declining to adjust.
+  const calibrationFit = loadCalibrationFit();
+  console.log(
+    `[run-prediction-cycle] calibration: ${calibrationFit.method}` +
+      (calibrationFit.method === "identity"
+        ? " (no adjustment)"
+        : ` a=${calibrationFit.a.toFixed(3)} b=${calibrationFit.b.toFixed(3)} n=${calibrationFit.n}`),
+  );
 
   const brainAgent = new BrainAgent({
     qualityThreshold: QUALITY_THRESHOLD,
     modelId: GEMINI_MODEL,
     brainQuery,
+    // Exact-slug fetch for the calibration page. brainQuery is a top-5 semantic
+    // search and could silently fail to return a page whose address we know.
+    brainGet,
     brainWrite: async (slug, content) => {
       await brainWrite(slug, content);
     },
     llmCall,
+    calibrationFit,
   });
 
   const newMarkets: PredictionMarket[] = [];
@@ -413,11 +359,50 @@ async function main(): Promise<void> {
   }
   console.log(`[run-prediction-cycle] ${newMarkets.length} accepted, ${rejected} rejected, ${skipped} skipped (API error)`);
 
+  // --- Deduplication against existing state --------------------------------
+  // The same venue contract can re-enter the pipeline on consecutive runs
+  // (seen-ids cap out, or the venue relists it).  `market.id` is always fresh,
+  // so without this check the state file grows a second row for the same
+  // Polymarket/Kalshi market, and the report prints both.
+  const existingVenueIds = new Set<string>();
+  for (const m of state.activeMarkets) {
+    const vid = m.metadata?.venueMarketId;
+    if (typeof vid === "string" && vid) existingVenueIds.add(vid);
+  }
+  let dupeCount = 0;
+  const dedupedNew: PredictionMarket[] = [];
+  for (const m of newMarkets) {
+    const vid = m.metadata?.venueMarketId;
+    if (typeof vid === "string" && vid && existingVenueIds.has(vid)) {
+      // Update the existing market's AI estimate rather than adding a dupe.
+      const existing = state.activeMarkets.find(
+        (e) => e.metadata?.venueMarketId === vid,
+      );
+      if (existing) {
+        existing.aiEstimate = m.aiEstimate;
+        existing.metadata.crowdQuote = m.metadata.crowdQuote;
+        existing.metadata.crowdProbability = m.metadata.crowdProbability;
+      }
+      dupeCount++;
+    } else {
+      dedupedNew.push(m);
+      if (typeof vid === "string" && vid) existingVenueIds.add(vid);
+    }
+  }
+  if (dupeCount > 0) {
+    console.log(`[run-prediction-cycle] deduplicated ${dupeCount} market(s) already in state`);
+  }
+
   // --- Market lifecycle -------------------------------------------------
   // ExecutionAgent shipped as library code that no runner ever imported, so
   // no market was ever monitored, expired, or resolved — which is also why
   // Brier scoring and the meta-model had nothing to work with.
   const execution = new ExecutionAgent({
+    // The venue's own settlement, read over HTTP. Without this the outcome had
+    // to be guessed by an LLM against a brain that holds no news — 56% accurate
+    // while claiming 90%+ confidence — or left to a human who was never going
+    // to adjudicate 59 markets by hand.
+    fetchVenueOutcome,
     brainQuery,
     brainWrite: async (slug, content) => {
       await brainWrite(slug, content);
@@ -427,7 +412,7 @@ async function main(): Promise<void> {
       state.resolvedMarkets.push(market);
     },
   });
-  for (const market of [...state.activeMarkets, ...newMarkets]) {
+  for (const market of [...state.activeMarkets, ...dedupedNew]) {
     execution.addMarket(market);
   }
   try {
@@ -440,15 +425,125 @@ async function main(): Promise<void> {
     `[run-prediction-cycle] lifecycle: ${stillActive.length} active, ${state.resolvedMarkets.length} resolved to date`,
   );
 
-  const marketsWithCrowd: MarketWithCrowd[] = newMarkets.map((market) => ({
-    market,
-    crowdProb: crowdBySignalId.get(market.sourceSignals[0] ?? ""),
-  }));
+  // Re-quote everything, not just this run's new markets. Crowd prices were read
+  // once at ingest and never again, so a report headed "54 active markets"
+  // carried two AI-vs-Crowd rows: the two created that run.
+  const now = new Date();
+  const liveMarkets = stillActive.filter((m) => isLive(m, now));
+  try {
+    const quotes = await refreshQuotes(liveMarkets);
+    for (const market of liveMarkets) {
+      const quote = quotes.get(market.id);
+      // A venue that failed or dropped the market keeps its stored quote; the
+      // renderer prints the age rather than a fresh-looking stale number.
+      if (!quote) continue;
+      market.metadata.crowdQuote = quote;
+      market.metadata.crowdProbability = quote.probability;
+    }
+    console.log(
+      `[run-prediction-cycle] re-quoted ${quotes.size}/${liveMarkets.length} live market(s)`,
+    );
+  } catch (err) {
+    console.error(`[run-prediction-cycle] quote refresh failed: ${(err as Error).message}`);
+  }
+
+  // --- Refresh the oldest estimates --------------------------------------
+  // Quotes refresh every cycle; estimates never did. The median stored estimate
+  // was 26 hours old (one was 157), so the report compared a live price against
+  // yesterday's view and published the difference as an opportunity — Bitcoin
+  // ran up overnight, the quote went 47% -> 87%, our 06:42 estimate stayed at
+  // 40%, and that 47-point "edge" was really just staleness. findAlphaCandidates
+  // now refuses estimates older than MAX_ESTIMATE_AGE_SECONDS, which hides the
+  // false signal; re-estimating is what actually fixes it.
+  //
+  // Capped hard: each refresh is one LLM call, and the free-tier pool is small.
+  // Oldest-first, only markets carrying a live quote — those are the only ones
+  // that can produce a tradeable comparison anyway.
+  const staleMarkets = liveMarkets
+    .filter((m) => {
+      const q = m.metadata?.crowdQuote as { basis?: string } | undefined;
+      if (q?.basis !== "orderbook_mid") return false;
+      const at = m.aiEstimate?.updatedAt;
+      if (!(at instanceof Date) || Number.isNaN(at.getTime())) return false;
+      // Same per-category window the alpha screen applies, so a market can never
+      // be too stale to publish yet not stale enough to refresh.
+      return now.getTime() - at.getTime() > maxEstimateAgeFor(m.category) * 1000;
+    })
+    // Widest gap first, not oldest first. Age alone spent the whole budget on
+    // week-old estimates that already agreed with the price (1.5% vs 1.3%),
+    // where the model correctly answered "nothing to change" and the call was
+    // wasted. The markets worth a call are the ones whose stored view has
+    // drifted furthest from the live price — those are exactly the rows that
+    // would otherwise be published as a false opportunity.
+    .sort((a, b) => {
+      const gap = (m: PredictionMarket): number => {
+        const q = m.metadata?.crowdQuote as { probability?: number } | undefined;
+        return typeof q?.probability === "number"
+          ? Math.abs(m.aiEstimate.yesProbability - q.probability)
+          : 0;
+      };
+      return gap(b) - gap(a);
+    })
+    .slice(0, MAX_REFRESH_PER_CYCLE);
+
+  if (staleMarkets.length > 0) {
+    console.log(
+      `[run-prediction-cycle] re-estimating ${staleMarkets.length} stale market(s) (widest gap first)`,
+    );
+    for (const market of staleMarkets) {
+      try {
+        const before = market.aiEstimate.yesProbability;
+        const updated = await execution.refreshMarketEstimate(market);
+        if (updated) {
+          console.log(
+            `    ${(before * 100).toFixed(1)}% -> ${(updated.yesProbability * 100).toFixed(1)}%  ${market.title.slice(0, 48)}`,
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[run-prediction-cycle] re-estimate failed for ${market.id}: ${(err as Error).message.slice(0, 120)}`,
+        );
+      }
+    }
+  }
+
+  // Normalize AI probabilities for related/multi-outcome markets to sum to 100%.
+  const normResult = normalizeRelatedMarkets(liveMarkets);
+  if (normResult.groupCount > 0) {
+    console.log(
+      `[run-prediction-cycle] normalized ${normResult.adjustedCount} market(s) across ${normResult.groupCount} group(s) to sum to 100%`,
+    );
+  }
+
+  // Then restore monotonicity across cumulative horizons, so a repaired estimate
+  // is what gets persisted, linked, and screened for alpha.
+  const monoResult = enforceMonotonicity(liveMarkets, { now });
+  if (monoResult.seriesCount > 0) {
+    console.log(
+      `[run-prediction-cycle] monotonicity: repaired ${monoResult.adjustments.length} estimate(s) across ${monoResult.seriesCount} series`,
+    );
+    for (const a of monoResult.adjustments) {
+      console.log(
+        `    ${(a.before * 100).toFixed(1)}% -> ${(a.after * 100).toFixed(1)}% ` +
+          `by ${a.deadline.toISOString().slice(0, 10)}  ${a.title.slice(0, 54)}`,
+      );
+    }
+  }
+
+  // Same cumulative question at two horizons, priced inconsistently. Computed
+  // AFTER both repairs so the detector sees what the report will actually print;
+  // running it first flagged inconsistencies that were about to be fixed.
+  // Recorded on the markets so the pairing survives into the next run's state.
+  const desyncLinks = relatedMarketIds(findStructuralDesyncs(liveMarkets, { now }));
+  for (const market of liveMarkets) {
+    const linked = desyncLinks.get(market.id);
+    if (linked) market.relatedMarkets = [...linked];
+  }
 
   const analyst = new AnalystAgent({ brainQuery, llmCall });
   // Pass resolved markets too — the report's Brier score is computed from them.
   const report = await analyst.generateDailyReport([...stillActive, ...state.resolvedMarkets]);
-  const reportMd = formatReportMarkdown(report, marketsWithCrowd);
+  const reportMd = formatReportMarkdown(report, stillActive, now);
 
   console.log("\n" + reportMd + "\n");
 

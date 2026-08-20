@@ -17,7 +17,15 @@ import type {
   MetaModelUpdate,
 } from "./types.js";
 import { parseLlmJson, logValidationFailure, optionalStringArray } from "./llm-json.js";
-import { CALIBRATION_SLUG, renderCalibrationPage, type CalibrationRule } from "./calibration.js";
+import { CALIBRATION_SLUG, renderFactualCalibrationPage } from "./calibration.js";
+import { fitCalibration, type CalibrationFit } from "./calibration-fit.js";
+import {
+  buildLearningSet,
+  recordsFromMarkets,
+  type BacktestRunLike,
+  type LearningSet,
+} from "./learning-set.js";
+import { horizonBucket, scoreByGroup, scoreForecasts } from "./scoring.js";
 import { formatPercent } from "./format.js";
 
 /** Brain slugs are filesystem-ish paths. Topic text comes straight from an LLM,
@@ -45,6 +53,12 @@ export interface DreamCycleOptions {
   getActiveMarkets?: () => PredictionMarket[];
   getResolvedMarkets?: () => PredictionMarket[];
   maxRunTimeMinutes?: number;
+  /** Saved backtest run, the largest source of venue-confirmed training data. */
+  getBacktestRun?: () => BacktestRunLike | null;
+  /** Persist the fitted mapping where the live cycle can read it without paying
+   *  for a brain CLI round-trip. The brain page is the audit surface; this is
+   *  the operational one. */
+  saveFit?: (fit: CalibrationFit) => Promise<void>;
 }
 
 export class DreamCycle {
@@ -58,6 +72,8 @@ export class DreamCycle {
   private getActiveMarkets: () => PredictionMarket[];
   private getResolvedMarkets: () => PredictionMarket[];
   private maxRunTimeMs: number;
+  private getBacktestRun?: () => BacktestRunLike | null;
+  private saveFit?: (fit: CalibrationFit) => Promise<void>;
 
   constructor(opts: DreamCycleOptions = {}) {
     this.brainQuery =
@@ -67,6 +83,8 @@ export class DreamCycle {
     this.getActiveMarkets = opts.getActiveMarkets ?? (() => []);
     this.getResolvedMarkets = opts.getResolvedMarkets ?? (() => []);
     this.maxRunTimeMs = (opts.maxRunTimeMinutes ?? 60) * 60_000;
+    this.getBacktestRun = opts.getBacktestRun;
+    this.saveFit = opts.saveFit;
   }
 
   /** A brainQuery that failed returns a marker string rather than throwing, so
@@ -95,9 +113,21 @@ export class DreamCycle {
     const resolved = this.getResolvedMarkets();
     const all = [...active, ...resolved];
 
-    // Phase 1: Full review
+    // Phase 1: Full review, fit, and PUBLISH.
+    //
+    // Publication used to sit at the very end, after four LLM phases and a
+    // deadline check. Any of them throwing discarded calibration that Phase 1
+    // had already finished computing — which is why only 20 of 61 historical
+    // runs ever published a page. The fit is pure arithmetic over resolved
+    // markets and cannot fail, so it is banked before anything fragile runs.
     console.log("[dream-cycle] Phase 1/5: Full market review...");
+    const learning = buildLearningSet({
+      markets: resolved,
+      backtest: this.loadBacktestRun(),
+    });
+    const fit = fitCalibration(learning.records);
     const accuracy = await this.reviewAccuracy(resolved);
+    await this.publishCalibration(learning, fit, resolved);
 
     // Phase 2: Generate forecasts
     this.checkDeadline(startTime, "phase 2");
@@ -118,11 +148,6 @@ export class DreamCycle {
     this.checkDeadline(startTime, "phase 5");
     console.log("[dream-cycle] Phase 5/5: Analyzing trends...");
     const trends = await this.analyzeTrends(all);
-
-    // Persist the meta-model as the page BrainAgent actually reads. Without
-    // this the loop is open: findings only ever reached the human-readable
-    // dream report, so every evaluation queried an address nothing wrote.
-    await this.publishCalibration(metaUpdates, resolved, accuracy);
 
     const duration = Date.now() - startTime;
 
@@ -150,34 +175,63 @@ export class DreamCycle {
     return report;
   }
 
-  /** Write the calibration rules page BrainAgent reads before every evaluation.
-   *  Always written, even with zero rules, so the read side gets an honest
-   *  "not enough history yet" instead of an empty search result. */
+  /** Load the saved backtest run, if there is one. Backtest records replay
+   *  against known venue outcomes, so they are oracle-grade by construction and
+   *  are by far the largest source of honest training data the system has. */
+  private loadBacktestRun(): BacktestRunLike | null {
+    if (this.getBacktestRun) return this.getBacktestRun();
+    return null;
+  }
+
+  /** Write the calibration page BrainAgent reads before every evaluation.
+   *
+   *  Always written — including when the fit declined to adjust — so the read
+   *  side gets an honest "not enough history yet" instead of the silence that
+   *  an empty semantic search produces and nothing can distinguish from a page
+   *  that simply says nothing. */
   private async publishCalibration(
-    updates: MetaModelUpdate[],
-    resolved: PredictionMarket[],
-    accuracy: number | null,
+    learning: LearningSet,
+    fit: CalibrationFit,
+    resolvedMarkets: PredictionMarket[],
   ): Promise<void> {
-    const rules: CalibrationRule[] = updates.map((u) => ({
-      rule: u.rule,
-      previousValue: u.previousValue,
-      newValue: u.newValue,
-      evidence: u.evidence,
-    }));
-
-    const avgBrierScore = accuracy === null ? null : 1 - accuracy;
-
     try {
+      const scorecard = scoreForecasts(learning.records);
+      const titles = new Map(resolvedMarkets.map((m) => [m.id, m.title]));
+
+      const worstMisses = [...learning.records]
+        .filter((r) => Number.isFinite(r.forecast))
+        .sort(
+          (a, b) =>
+            (b.forecast - (b.outcome ? 1 : 0)) ** 2 - (a.forecast - (a.outcome ? 1 : 0)) ** 2,
+        )
+        .slice(0, 5)
+        .map((record) => ({ record, title: titles.get(record.id) }));
+
       await this.brainWrite(
         CALIBRATION_SLUG,
-        renderCalibrationPage(rules, {
-          marketsReviewed: resolved.length,
-          avgBrierScore,
+        renderFactualCalibrationPage({
+          fit,
+          scorecard,
+          byGroup: scoreByGroup(learning.records, (r) => r.group ?? "unknown"),
+          byHorizon: scoreByGroup(learning.records, horizonBucket),
+          worstMisses,
+          autoScorecard:
+            learning.excludedAuto.length > 0 ? scoreForecasts(learning.excludedAuto) : null,
+          sources: learning.sources,
+          pricedCount: learning.pricedCount,
         }),
       );
+
       console.log(
-        `[dream-cycle] calibration page updated (${rules.length} rule(s), ${resolved.length} resolved market(s))`,
+        `[dream-cycle] calibration page updated — fit=${fit.method}, ` +
+          `${learning.records.length} oracle-grade record(s) ` +
+          `(${learning.sources.live} live + ${learning.sources.backtest} backtest), ` +
+          `${learning.excludedAuto.length} auto excluded`,
       );
+
+      if (this.saveFit) {
+        await this.saveFit(fit);
+      }
     } catch (err) {
       console.error(`[dream-cycle] failed to publish calibration: ${(err as Error).message}`);
     }
@@ -191,20 +245,20 @@ export class DreamCycle {
   ): Promise<number | null> {
     if (resolved.length === 0) return null;
 
-    let totalBrier = 0;
-    let count = 0;
+    // Scored through the shared implementation rather than a local Brier loop:
+    // three hand-rolled copies of the same formula was three places for it to
+    // drift. This one pools auto and oracle deliberately — it is the historical
+    // accuracy log, not the learning set, and the split is reported separately
+    // on the calibration page.
+    const { oracle, auto } = recordsFromMarkets(resolved);
+    const pooled = [...oracle, ...auto];
+    if (pooled.length === 0) return null;
 
-    for (const market of resolved) {
-      if (!market.resolution) continue;
-      const predicted = market.aiEstimate.yesProbability;
-      const actual = market.resolution.outcome === "yes" ? 1 : 0;
-      totalBrier += Math.pow(predicted - actual, 2);
-      count++;
-    }
-
+    const card = scoreForecasts(pooled);
+    const count = card.count;
     if (count === 0) return null;
 
-    const avgBrier = totalBrier / count;
+    const avgBrier = card.meanBrier;
     const accuracy = 1 - avgBrier; // inverted Brier: higher = better
 
     // Dated slug: the old fixed `accuracy-log` slug overwrote itself every

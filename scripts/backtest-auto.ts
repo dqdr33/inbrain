@@ -54,9 +54,20 @@ interface Progress {
   quotaWaits: number;
 }
 
+/**
+ * Per-lane forecast target.
+ *
+ * Raised from 90 to 150 to match `MIN_FIT_SAMPLES` in calibration-fit.ts: below
+ * 150 oracle-grade records the calibration layer refuses to fit and stays at
+ * identity, so a backtest that stops at 90 can never switch the learning loop
+ * on. 119 snapshots x 3 offsets is a ceiling of ~357 forecasts per lane, so the
+ * target is reachable without fetching more history.
+ */
+const TARGET_FORECASTS = 150;
+
 const EMPTY: Progress = {
   done: { blind: 0, priced: 0 },
-  target: 90,
+  target: TARGET_FORECASTS,
   lastRunAt: new Date(0).toISOString(),
   lastOutcome: "never run",
   quotaWaits: 0,
@@ -71,7 +82,10 @@ function loadProgress(): Progress {
         blind: Number(p.done?.blind) || 0,
         priced: Number(p.done?.priced) || 0,
       },
-      target: Number(p.target) || EMPTY.target,
+      // The CODE owns the target, not the saved file. Reading it back from disk
+      // meant a target raised in source was silently ignored forever, because
+      // the stale value in .backtest-progress.json always won.
+      target: EMPTY.target,
       lastRunAt: typeof p.lastRunAt === "string" ? p.lastRunAt : EMPTY.lastRunAt,
       lastOutcome: typeof p.lastOutcome === "string" ? p.lastOutcome : EMPTY.lastOutcome,
       quotaWaits: Number(p.quotaWaits) || 0,

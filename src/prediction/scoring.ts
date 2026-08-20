@@ -190,6 +190,14 @@ export function skillScore(modelBrier: number, referenceBrier: number): number {
   // then explodes to an arbitrarily large negative number that looks like a
   // catastrophic finding and is pure artifact. NaN says "not measurable here",
   // which is the truth, and formatScorecard prints it as n/a.
+  //
+  // Note that a merely SMALL reference still yields a huge finite ratio: a
+  // near-certain venue price (0.99 on a YES) scores ~1e-4, and real data
+  // produced per-group skill of -8065 and -11393 that way. That is arithmetic,
+  // not a bug — the number is correct and simply unreadable as a magnitude.
+  // Suppressing it here would hide a legitimate measurement from callers that
+  // want it, so presentation layers cap it instead (see `skillText` in
+  // calibration.ts). This function stays honest; the page stays readable.
   if (referenceBrier < 1e-9) return NaN;
   return 1 - modelBrier / referenceBrier;
 }

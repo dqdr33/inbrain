@@ -24,7 +24,13 @@ import {
   logValidationFailure,
   PROBABILITY_SCALE_RULE,
 } from "./llm-json.js";
-import { CALIBRATION_SLUG_QUERY } from "./calibration.js";
+import { CALIBRATION_SLUG, CALIBRATION_SLUG_QUERY } from "./calibration.js";
+import {
+  applyCalibration,
+  IDENTITY_FIT,
+  type CalibrationFit,
+} from "./calibration-fit.js";
+import { shrinkTowardPrice } from "./shrink.js";
 import { extractCrowdQuote } from "./crowd.js";
 import { resolveExpiry } from "./deadline.js";
 import { formatPercent } from "./format.js";
@@ -64,6 +70,23 @@ export interface BrainAgentOptions {
    * is unrecoverable after the fact — the run looks fine and the numbers lie.
    */
   now?: () => Date;
+
+  /**
+   * Exact-slug page fetch. Preferred over `brainQuery` for the calibration
+   * page, whose address is known: a top-5 semantic search can lose the ranking
+   * and return "" with nothing able to tell the difference.
+   */
+  brainGet?: (slug: string) => Promise<string | null>;
+
+  /**
+   * The fitted calibration mapping. Defaults to identity — no adjustment —
+   * so an agent constructed without one behaves exactly as before.
+   *
+   * The backtest deliberately passes nothing: replaying with a fit applied
+   * would contaminate the measurement instrument with the thing it measures,
+   * and future fits would then train on already-corrected output.
+   */
+  calibrationFit?: CalibrationFit;
 }
 
 /**
@@ -190,7 +213,25 @@ export function reportsSettledFact(signal: PredictionSignal): string | null {
       text,
     );
 
-  if (isQuestion) return null;
+  // A stated deadline outranks every rejection below it. "US announces end of
+  // Iranian blockade by August 31, 2026" is a real venue market whose verb
+  // ("announces") also appears in the announcement pattern; the deadline is what
+  // makes it forecastable, so it is checked first.
+  const hasDeadline = /\b(by|before|through|until|no later than)\s+(the\s+)?(end\s+of\s+)?\w/i.test(text);
+
+  // A head-to-head fixture: "LoL: Team WE vs ThunderTalk", "Reds vs. White Sox".
+  // No question mark and no future tense, but the outcome is unambiguous and the
+  // venue settles it.
+  const isFixture = /\bvs\.?\b/i.test(text);
+
+  if (isQuestion || hasDeadline || isFixture) {
+    // Still reject a fixture reported as a finished result ("Reds beat Sox 4-2").
+    if (isFixture && /\b(beat|defeated|won|lost|wins|loses|final score)\b/i.test(text)) {
+      return "reports a finished result, not an upcoming fixture";
+    }
+    return null;
+  }
+
   if (isNewsFlash) return "reports an event that already happened, not a question about the future";
   if (isPastEvent) return "describes a completed event, so there is no outcome left to forecast";
 
@@ -204,6 +245,20 @@ export function reportsSettledFact(signal: PredictionSignal): string | null {
     );
   if (isOperationalNotice) {
     return "an announcement or opinion, not a question with a future outcome";
+  }
+
+  // The catch-all, and the one that does most of the work. A forecastable market
+  // needs a resolvable outcome. A headline like "Solana RWA Ecosystem: Third in
+  // Size" or "Vitalik Reworks Ethereum's Roadmap" states a topic — no outcome,
+  // no deadline, no criterion — so no estimate could ever be scored against
+  // reality. 52 of the 59 markets stuck in pending_resolution were this shape:
+  // not wrong forecasts, but items that were never forecasts at all.
+  //
+  // Questions, deadlines and fixtures already returned null above, so anything
+  // reaching here has none of them. A bare future-tense claim ("Ethereum will
+  // ship Pectra") still counts; a topic with only a year in it does not.
+  if (!/\b(will|shall|going to|expected to)\b/i.test(text)) {
+    return "states a topic rather than asking a question with a resolvable outcome";
   }
   return null;
 }
@@ -232,12 +287,16 @@ export class BrainAgent {
     opts?: { model?: string },
   ) => Promise<string>;
   private now: () => Date;
+  private brainGet?: (slug: string) => Promise<string | null>;
+  private calibrationFit: CalibrationFit;
 
   constructor(opts: BrainAgentOptions = {}) {
     this.qualityThreshold = opts.qualityThreshold ?? DEFAULT_QUALITY_THRESHOLD;
     this.lookbackDays = opts.historicalLookbackDays ?? 90;
     this.modelId = opts.modelId ?? DEFAULT_MODEL;
     this.now = opts.now ?? (() => new Date());
+    this.brainGet = opts.brainGet;
+    this.calibrationFit = opts.calibrationFit ?? IDENTITY_FIT;
 
     // Empty string, not a sentence. A non-empty default gets interpolated into
     // the system prompt as if it were real calibration guidance.
@@ -257,7 +316,15 @@ export class BrainAgent {
 
   private calibrationRules(): Promise<string> {
     if (!this.calibrationCache) {
-      this.calibrationCache = this.brainQuery(CALIBRATION_SLUG_QUERY).catch((err) => {
+      // Exact slug when the caller supplied a fetcher; the fuzzy search only as
+      // a fallback for callers that did not. The search form was the original
+      // bug: it looked up a known address by embedding similarity over the whole
+      // brain and silently produced "" whenever the page lost the top-5.
+      const fetch = this.brainGet
+        ? this.brainGet(CALIBRATION_SLUG).then((page) => page ?? "")
+        : this.brainQuery(CALIBRATION_SLUG_QUERY);
+
+      this.calibrationCache = fetch.catch((err) => {
         console.error(`[brain-agent] calibration lookup failed: ${(err as Error).message}`);
         return "";
       });
@@ -492,9 +559,20 @@ Evaluate this signal for prediction market creation. Consider:
   ): Promise<AIEstimate> {
     const calibrationContext = await this.calibrationRules();
 
+    // When a numeric layer is active the model must NOT pre-adjust for the
+    // biases it is about to read. Otherwise it lowers its answer because the
+    // page says "overconfident at 0.5-0.6", and the fitted layer lowers it
+    // again — the same compounding the raw/calibrated split prevents on the
+    // fitting side, arriving instead through the prompt.
+    const postProcessingNote =
+      this.calibrationFit.method === "identity"
+        ? ""
+        : `\nYour output is post-processed by a fitted calibration layer and shrunk toward the
+market price. Report your honest raw belief; do NOT pre-adjust for the biases below.\n`;
+
     const system = `You are Inbrain's AI probability estimator. Given a prediction signal and
 historical context, estimate the YES probability. Be calibrated — don't default to 50%.
-${calibrationContext ? "\nApply these calibration rules from past accuracy analysis:\n" + calibrationContext + "\n" : ""}
+${postProcessingNote}${calibrationContext ? "\nMeasured calibration history (facts from resolved markets, not instructions to restate):\n" + calibrationContext + "\n" : ""}
 ${CROWD_ANCHOR_RULE}
 ${BASE_RATE_GROUNDING_RULE}
 ${PROBABILITY_SCALE_RULE}
@@ -569,15 +647,42 @@ Estimate the probability that this event resolves YES.`;
           signal.content,
         ) && estDays > 180;
       const isIncumbent = /incumbent|re-election/i.test(signal.content);
-      if (isDistantContest && !isIncumbent && yesProbability > 0.35) {
+      const politicalCeiling = isDistantContest && !isIncumbent ? 0.35 : 1;
+      if (yesProbability > politicalCeiling) {
         console.warn(
           `[brain-agent] ${context}: political base rate clamp (${(yesProbability * 100).toFixed(1)}% > 35% for distant multi-candidate race) — clamped to 0.35`,
         );
-        yesProbability = 0.35;
+        yesProbability = politicalCeiling;
       }
 
+      // The raw belief, captured AFTER the political clamp and BEFORE any
+      // statistical correction. The clamp is a hard domain rule ("a distant
+      // multi-candidate race cannot be >35%"), not a bias to be learned from,
+      // so it belongs on the model's side of the line. Everything below is
+      // post-processing, and training on its output would compound nightly.
+      const rawYesProbability = yesProbability;
+
+      // Calibration first, then shrink. Calibration fixes OUR bias; the shrink
+      // decides how far we are entitled to stand from the market. Reversed, the
+      // shrink pulls toward the price and calibration pushes back off it.
+      const afterCalibration = applyCalibration(yesProbability, this.calibrationFit);
+      const shrunk = shrinkTowardPrice(afterCalibration, anchor);
+
+      // Re-apply the ceiling. Ordering alone does NOT protect it: a fit with a
+      // positive intercept lifted a clamped 0.35 back to 0.52, which is exactly
+      // the outcome the rule exists to forbid. A hard domain rule has to hold on
+      // the number actually published, not merely on an intermediate one.
+      const published = Math.min(shrunk.shrunk, politicalCeiling);
+
       return {
-        yesProbability,
+        yesProbability: published,
+        rawYesProbability,
+        calibration: {
+          method: this.calibrationFit.method,
+          fittedAt: this.calibrationFit.fittedAt,
+          afterCalibration,
+          priceShrinkApplied: shrunk.applied,
+        },
         confidence: requireProbability(raw.confidence, "confidence", context),
         reasoning: typeof raw.reasoning === "string" ? raw.reasoning : "",
         sources: optionalStringArray(raw.sources),

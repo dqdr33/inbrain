@@ -175,6 +175,18 @@ export async function replayOne(
 
   const est = result.market.aiEstimate;
 
+  // The RAW model output, before the calibration layer and the price shrink.
+  //
+  // The backtest is the instrument that measures whether those corrections help;
+  // replaying with them already applied would measure the corrections against
+  // themselves. Worse, the results file is a training input, so scoring
+  // post-shrink output would feed corrected numbers back into the next fit —
+  // the compounding this whole design exists to prevent.
+  //
+  // `rawYesProbability` is absent only on the fallback path below, where the
+  // ?? fallback is exactly right.
+  const rawForecast = est.rawYesProbability ?? est.yesProbability;
+
   // BrainAgent answers 0.5 at confidence 0.1 when the model's JSON could not be
   // parsed or validated — a transport failure wearing the shape of a forecast.
   // Scoring it as a real 50% call would be wrong in both directions: it inflates
@@ -183,8 +195,8 @@ export async function replayOne(
   //
   // Recorded as NaN so `scoreForecasts` drops it and says how many it dropped,
   // rather than silently deleting the row here.
-  const isFallback = est.yesProbability === 0.5 && est.confidence <= 0.1;
-  const forecast = isFallback ? NaN : est.yesProbability;
+  const isFallback = rawForecast === 0.5 && est.confidence <= 0.1;
+  const forecast = isFallback ? NaN : rawForecast;
 
   return {
     ...base,
