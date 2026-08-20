@@ -52,3 +52,24 @@ predictions/knowledge/
 # Daily prediction reports (local files, not committed)
 Report/
 .github/workflows/
+
+# Prediction pipeline runtime state (markets, seen signal ids). Rebuilt by
+# scripts/run-prediction-cycle.ts; never meant to be committed.
+.prediction-state.json
+.prediction-state.json.tmp-*
+
+# Run transcripts and generated reports from run-analytics-cycle.ps1.
+logs/
+Report/
+
+# Cross-process run locks (scripts/lib/run-lock.ts)
+.locks/
+.prediction-state.*.bak
+.gemini-key-state.*.bak
+
+# Backtest snapshot cache (regenerate with scripts/backtest-fetch.ts)
+.backtest-snapshots.json
+.backtest-results*.json
+# Run data is committed to the `backtest-data` orphan branch by
+# scripts/backtest-commit.ts, deliberately never to main.
+.backtest-progress.json
