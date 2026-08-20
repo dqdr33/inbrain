@@ -32,6 +32,64 @@ bun run scripts/backtest-score.ts --compare
 `backtest-score.ts` re-scores saved results without LLM calls, so fixing a
 metric bug costs a second rather than a whole run.
 
+## Running it unattended
+
+The backtest is never urgent — it scores history, and history does not move.
+What it must never do is spend the paid Gemini key, which is reserved for the
+live prediction cycle.
+
+```bash
+bun run backtest:status   # lanes, quota, last outcome — changes nothing
+bun run backtest:auto     # one slice IF free quota exists, else exit 0
+bun run backtest:commit   # bank run data to the backtest-data branch
+```
+
+`backtest-auto.ts` reads the existing key pool and refuses when only the paid
+key is available, exiting 0 in milliseconds having spent nothing. That is what
+makes a frequent schedule safe.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\backtest-schedule.ps1
+powershell -ExecutionPolicy Bypass -File scripts\backtest-schedule.ps1 -Status
+powershell -ExecutionPolicy Bypass -File scripts\backtest-schedule.ps1 -Remove
+```
+
+Hourly is deliberate: Google resets free quota at Pacific midnight and the live
+cycle competes for the same daily budget, so checking often and backing off
+instantly beats one daily attempt that may land when the pool is dry. Slices
+default to 20 forecasts (~40 calls) to leave that budget largely intact.
+
+The runner prefers the **blind** lane until it reaches target, because without
+the control the priced numbers cannot be distinguished from memorised outcomes.
+
+### Why slices resume instead of re-sampling
+
+Task order is a deterministic shuffle from a fixed seed, and each forecast has a
+stable id (`backtest_<venue>_<market>_<as-of-date>`). `--append` skips ids
+already banked, so slice N+1 continues slice N's walk. Results are written after
+every chunk, so a killed slice keeps what it paid for.
+
+### Run data lives on its own branch
+
+Code and measurement have opposite lifecycles. Code is reviewed, bisected and
+read as history; run data is append-only output that grows by a slice per tick.
+Mixed into `main` it would drown `git log`, wreck `git bisect`, and bloat every
+clone permanently.
+
+So `scripts/backtest-commit.ts` commits results to **`backtest-data`**, an
+orphan branch with no shared history with `main` — a filing cabinet in the same
+repo, not a fork of the code. It works through a temporary git index, so the
+working tree is never touched and there is no branch switch to get stuck
+halfway.
+
+The branch advances only when *forecast* data changes. Comparing whole trees was
+not enough: `.backtest-progress.json` carries `lastRunAt` and a quota-wait
+counter that move on every tick, which would mint an empty commit an hour.
+
+Snapshots are deliberately **not** committed — a large, regenerable cache of
+public venue data. Run data is not pushed automatically; publish with
+`git push origin backtest-data`.
+
 ## Design
 
 ### Snapshots, not live fetches
