@@ -135,15 +135,34 @@ const tree = gitEnv("write-tree");
 // --- commit onto the orphan branch ------------------------------------------
 const parent = gitOk("rev-parse", "--verify", `${BRANCH}^{commit}`);
 
-// Nothing changed since the last data commit? Say so and stop — an
-// opportunistic scheduler calls this every tick, and empty commits would bury
-// the real ones.
-if (parent) {
-  const parentTree = gitOk("rev-parse", `${parent}^{tree}`);
-  if (parentTree === tree) {
-    console.log("[backtest-commit] run data unchanged since the last commit — nothing to do");
-    process.exit(0);
+/**
+ * Has any actual FORECAST data changed since the last commit?
+ *
+ * Comparing whole trees is not enough: `.backtest-progress.json` carries
+ * bookkeeping (`lastRunAt`, `quotaWaits`) that moves on every scheduler tick
+ * even when no forecast was made. Under an hourly schedule that would mint a
+ * commit an hour, burying the handful that record real measurement.
+ *
+ * So the results files decide, and progress rides along with whatever commit
+ * they trigger.
+ */
+function forecastDataChanged(): boolean {
+  if (!parent) return true;
+  for (const file of present) {
+    if (!file.startsWith(".backtest-results")) continue;
+    const prior = gitOk("rev-parse", `${parent}:${file}`);
+    const current = git("hash-object", join(ROOT, file));
+    if (prior !== current) return true;
   }
+  // Also treat a newly-appearing results file as a change (e.g. the blind lane
+  // producing its first output).
+  const priorFiles = new Set((gitOk("ls-tree", "--name-only", parent) ?? "").split("\n"));
+  return present.some((f) => f.startsWith(".backtest-results") && !priorFiles.has(f));
+}
+
+if (!forecastDataChanged()) {
+  console.log("[backtest-commit] no new forecasts since the last commit — nothing to do");
+  process.exit(0);
 }
 
 const totalBytes = present.reduce((n, f) => n + statSync(join(ROOT, f)).size, 0);
