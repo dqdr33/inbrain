@@ -591,6 +591,16 @@ async function main(): Promise<void> {
       `[run-prediction-cycle] normalized ${normResult.adjustedCount} market(s) across ${normResult.groupCount} group(s) to sum to 100%`,
     );
   }
+  // A group the venue prices say is not exclusive is almost always one outcome
+  // listed twice under two venue ids. Surfaced rather than silently skipped:
+  // the duplicate wastes an estimate slot every run and should be retired.
+  for (const g of normResult.incoherent) {
+    console.warn(
+      `[run-prediction-cycle] group "${g.groupKey}" left unnormalized — venue prices sum to ` +
+        `${(g.venueSum * 100).toFixed(1)}%, so these are not competing outcomes (likely a duplicate listing):`,
+    );
+    for (const t of g.titles) console.warn(`    - ${t.slice(0, 76)}`);
+  }
 
   // Then restore monotonicity across cumulative horizons, so a repaired estimate
   // is what gets persisted, linked, and screened for alpha.

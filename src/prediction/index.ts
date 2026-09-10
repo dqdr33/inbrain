@@ -76,7 +76,11 @@ export {
   parseThresholdMagnitude,
   thresholdDirection,
 } from "./normalize.js";
-export type { NormalizationResult, ProbabilityConflict } from "./normalize.js";
+export type {
+  NormalizationResult,
+  ProbabilityConflict,
+  IncoherentGroup,
+} from "./normalize.js";
 
 export {
   enforceMonotonicity,

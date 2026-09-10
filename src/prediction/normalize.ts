@@ -61,6 +61,19 @@ export interface NormalizationResult {
   /** Groups whose members are mutually exclusive but sum over 100%. Rescaled,
    *  and reported so the caller can keep them out of narrative sections. */
   conflicts: ProbabilityConflict[];
+  /** Groups the venue's own prices say are NOT exclusive — almost always one
+   *  outcome listed twice. Left unrescaled and reported, because the defect is
+   *  in the grouping and silently skipping them would hide a duplicate listing
+   *  the operator should see. */
+  incoherent: IncoherentGroup[];
+}
+
+export interface IncoherentGroup {
+  groupKey: string;
+  /** Sum of the venue prices, e.g. 1.747 for the duplicated Russian listing. */
+  venueSum: number;
+  marketIds: string[];
+  titles: string[];
 }
 
 export interface ProbabilityConflict {
@@ -92,6 +105,7 @@ export function normalizeRelatedMarkets(
   let groupCount = 0;
   let adjustedCount = 0;
   const conflicts: ProbabilityConflict[] = [];
+  const incoherent: IncoherentGroup[] = [];
 
   for (const [key, group] of groups.entries()) {
     if (group.length < 2) continue;
@@ -129,6 +143,34 @@ export function normalizeRelatedMarkets(
       continue;
     }
 
+    // The venue is the check on our own grouping. Mutually exclusive outcomes
+    // cannot ALL be likely at once, so a group whose venue prices sum far above
+    // 100% is not a contest — it is a grouping mistake, and rescaling to 1.0
+    // would charge our estimates for an error in the key, not in the estimate.
+    //
+    // The 2026-09-10 Russian parliamentary group is the case: "United Russia
+    // GAIN the most seats" (venue 74.5%) and "United Russia WIN the most seats"
+    // (venue 99%) are the same question listed twice by the venue under two
+    // market ids, so deduplicateMarkets — which keys on venueMarketId — cannot
+    // see them as one. extractContestKey treats win/gain as the same verb and
+    // drops the candidate name, which is right for a real multi-candidate race
+    // and wrong here: it grouped one candidate with itself. Venue prices summed
+    // to 174.7%, the rescale charged the whole excess to the rung furthest from
+    // its price, and a 66.7% estimate published as 26.4% against a venue at 99%.
+    //
+    // Markets without a price are counted as 0, so a partially-quoted group is
+    // judged only on what it can actually see and stays eligible.
+    if (venueSumExceedsExclusivity(group)) {
+      restoreRaw(group);
+      incoherent.push({
+        groupKey: key,
+        venueSum: venuePriceSum(group),
+        marketIds: group.map((m) => m.id),
+        titles: group.map((m) => m.title),
+      });
+      continue;
+    }
+
     conflicts.push({
       groupKey: key,
       rawSum: sum,
@@ -148,7 +190,50 @@ export function normalizeRelatedMarkets(
     }
   }
 
-  return { groupCount, adjustedCount, conflicts };
+  return { groupCount, adjustedCount, conflicts, incoherent };
+}
+
+/**
+ * How far above 100% a group's venue prices may sum before the group itself is
+ * suspect rather than our estimates.
+ *
+ * Real exclusive contests do overshoot a little: each contract carries a spread,
+ * and a venue's outcome set is not always exhaustive. 115% absorbs that. What it
+ * does not absorb is a duplicate — two listings of one outcome priced at 74.5%
+ * and 99% put the group at 175%, which no amount of spread explains.
+ */
+const VENUE_EXCLUSIVITY_MAX = 1.15;
+
+/** Sum of the venue prices in a group. Members without a quoted price count as
+ *  0, so a partially-quoted group is never condemned by what it cannot see. */
+function venuePriceSum(group: PredictionMarket[]): number {
+  let total = 0;
+  for (const m of group) {
+    const quote = m.metadata?.crowdQuote as CrowdQuote | undefined;
+    const price =
+      typeof quote?.probability === "number" ? quote.probability : m.metadata?.crowdProbability;
+    if (typeof price === "number" && Number.isFinite(price)) total += price;
+  }
+  return total;
+}
+
+/**
+ * Does the venue itself contradict the claim that this group is exclusive?
+ *
+ * Requires at least two priced members: one price can never establish that a
+ * SET sums too high, and reading a single quote as a verdict on the group would
+ * let one mispriced contract dissolve a legitimate contest.
+ */
+function venueSumExceedsExclusivity(group: PredictionMarket[]): boolean {
+  let priced = 0;
+  for (const m of group) {
+    const quote = m.metadata?.crowdQuote as CrowdQuote | undefined;
+    const price =
+      typeof quote?.probability === "number" ? quote.probability : m.metadata?.crowdProbability;
+    if (typeof price === "number" && Number.isFinite(price)) priced++;
+  }
+  if (priced < 2) return false;
+  return venuePriceSum(group) > VENUE_EXCLUSIVITY_MAX;
 }
 
 /**
@@ -324,6 +409,10 @@ export function validateNormalizedProbabilities(markets: PredictionMarket[]): vo
   const groups = groupMarkets(markets);
   for (const [key, group] of groups.entries()) {
     if (group.length < 2) continue;
+    // Same verdict as the normalizer: if the venue says these are not competing
+    // outcomes, forcing them to 1.0 here would undo the skip on the next line
+    // of the pipeline.
+    if (venueSumExceedsExclusivity(group)) continue;
     const sum = group.reduce((acc, m) => acc + m.aiEstimate.yesProbability, 0);
     if (sum > 1.01) {
       console.warn(

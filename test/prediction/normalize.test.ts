@@ -827,6 +827,110 @@ describe("nested threshold ladders are not a distribution (the LAPTOP 0.1% bug)"
   }
 });
 
+describe("the venue vetoes a group it prices as non-exclusive", () => {
+  function m(id: string, ai: number, venue: number, title: string): PredictionMarket {
+    return fakeMarket({
+      id,
+      title,
+      category: "politics",
+      metadata: {
+        eventKey: id,
+        crowdProbability: venue,
+        crowdQuote: {
+          probability: venue,
+          basis: "orderbook_mid",
+          venue: "polymarket",
+          spread: 0.01,
+          asOf: new Date("2026-09-10T13:42:56Z"),
+        },
+      },
+      aiEstimate: {
+        yesProbability: ai,
+        confidence: 0.9,
+        reasoning: "",
+        sources: [],
+        modelVersion: "test",
+        updatedAt: new Date("2026-09-10T07:41:22Z"),
+      },
+    });
+  }
+
+  /** The 2026-09-10 Russian parliamentary group: one party's outcome listed
+   *  twice by the venue ("gain the most seats" / "win the most seats") under two
+   *  market ids, so deduplicateMarkets cannot see them as one. */
+  const duplicated = () => [
+    m("y", 0.05, 0.012, "Will party-a-example gain the most seats in the next Russian parliamentary election?"),
+    m("g", 0.74, 0.745, "Will party-b-example gain the most seats in the next Russian parliamentary election?"),
+    m("w", 0.6667, 0.99, "Will party-b-example win the most seats in the next Russian parliamentary election?"),
+  ];
+
+  it("leaves the estimates untouched when venue prices sum far above 100%", () => {
+    // Venue sums to 174.7%, which is impossible for exclusive outcomes. The
+    // defect is in the grouping, so the estimates must not pay for it: the
+    // 66.7% rung published as 26.4% against a venue price of 99%.
+    const markets = duplicated();
+    const res = normalizeRelatedMarkets(markets);
+
+    expect(res.groupCount).toBe(0);
+    expect(markets[2]!.aiEstimate.yesProbability).toBeCloseTo(0.6667, 6);
+    expect(markets[1]!.aiEstimate.yesProbability).toBeCloseTo(0.74, 6);
+  });
+
+  it("reports the group instead of skipping it silently", () => {
+    const res = normalizeRelatedMarkets(duplicated());
+    expect(res.incoherent).toHaveLength(1);
+    expect(res.incoherent[0]!.venueSum).toBeCloseTo(1.747, 3);
+    expect(res.incoherent[0]!.titles).toHaveLength(3);
+  });
+
+  it("survives the invariant validator", () => {
+    const markets = duplicated();
+    normalizeRelatedMarkets(markets);
+    validateNormalizedProbabilities(markets);
+    expect(markets[2]!.aiEstimate.yesProbability).toBeCloseTo(0.6667, 6);
+  });
+
+  it("still normalizes a contest the venue prices coherently", () => {
+    // Same shape, venue sums to 100.2% — spread, not a duplicate. This group
+    // must still be rescaled, or the veto would disable normalization wholesale.
+    const markets = [
+      m("a", 0.7, 0.55, "Will candidate-a-example win the 2028 mayoral election?"),
+      m("b", 0.6, 0.4, "Will candidate-b-example win the 2028 mayoral election?"),
+      m("c", 0.1, 0.052, "Will candidate-c-example win the 2028 mayoral election?"),
+    ];
+    const res = normalizeRelatedMarkets(markets);
+    expect(res.groupCount).toBe(1);
+    expect(res.incoherent).toHaveLength(0);
+    const sum = markets.reduce((a, k) => a + k.aiEstimate.yesProbability, 0);
+    expect(sum).toBeCloseTo(1.0, 6);
+  });
+
+  it("does not veto on a single quoted member", () => {
+    // One price cannot establish that a SET sums too high. A lone contract at
+    // 99% beside unquoted siblings must not dissolve the group.
+    const markets = [
+      m("a", 0.7, 0.99, "Will candidate-a-example win the 2029 mayoral election?"),
+      fakeMarket({
+        id: "b",
+        title: "Will candidate-b-example win the 2029 mayoral election?",
+        category: "politics",
+        metadata: { eventKey: "b" },
+        aiEstimate: {
+          yesProbability: 0.6,
+          confidence: 0.8,
+          reasoning: "",
+          sources: [],
+          modelVersion: "test",
+          updatedAt: new Date("2026-09-10T07:41:22Z"),
+        },
+      }),
+    ];
+    const res = normalizeRelatedMarkets(markets);
+    expect(res.incoherent).toHaveLength(0);
+    expect(res.groupCount).toBe(1);
+  });
+});
+
 describe("anchor-weighted normalization does not clamp", () => {
   function m(id: string, p: number, venue: number, title: string): PredictionMarket {
     return fakeMarket({
@@ -892,10 +996,12 @@ describe("anchor-weighted normalization does not clamp", () => {
   });
 
   it("never leaves a member below the floor", () => {
+    // Venue prices sum to 1.0 — a coherent contest — while the estimates sum to
+    // 170% and one of them is far enough from its price to overshoot the cut.
     const markets = [
-      m("x1", 0.9, 0.9, "Will candidate-a-example win the 2028 mayoral election?"),
-      m("x2", 0.7, 0.7, "Will candidate-b-example win the 2028 mayoral election?"),
-      m("x3", 0.1, 0.85, "Will candidate-c-example win the 2028 mayoral election?"),
+      m("x1", 0.9, 0.55, "Will candidate-a-example win the 2028 mayoral election?"),
+      m("x2", 0.7, 0.42, "Will candidate-b-example win the 2028 mayoral election?"),
+      m("x3", 0.1, 0.03, "Will candidate-c-example win the 2028 mayoral election?"),
     ];
     normalizeRelatedMarkets(markets);
 
