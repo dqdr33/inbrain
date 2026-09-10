@@ -854,24 +854,56 @@ describe("anchor-weighted normalization does not clamp", () => {
     });
   }
 
-  it("falls back to proportional when a cut would exceed the estimate", () => {
-    // Contrived exclusive group where anchor-weighting overshoots: the third
-    // estimate is small AND far from its venue, so it absorbs more excess than
-    // it has. Previously that produced the 0.001 clamp; now the whole group
-    // falls back to proportional, which cannot go negative.
+  it("keeps a far-from-market estimate anchored when the cut overshoots", () => {
+    // The nine-candidate 2026 Brazilian field, whose raw estimates sum to 177%.
+    // A single-pass distance-weighted cut drives at least one member negative
+    // here, so the overshoot path runs. It must still ANCHOR: the 75% estimate
+    // priced at 0.5% by the venue has to come down hard. Plain proportional
+    // would lift it to 42% — further from the market than before normalizing —
+    // which is exactly what anchor weighting exists to prevent.
+    const field: Array<[string, number, number]> = [
+      ["zema", 0.75, 0.005],
+      ["caiado", 0.005, 0.003],
+      ["santos", 0.02, 0.019],
+      ["lula", 0.57, 0.515],
+      ["marcal", 0.015, 0.001],
+      ["bolsonaro", 0.39, 0.465],
+      ["alckmin", 0.01, 0.002],
+      ["cury", 0.01, 0.003],
+      ["jair", 0.001, 0.002],
+    ];
+    const markets = field.map(([name, ai, venue]) =>
+      m(name, ai, venue, `Will ${name}-example win the 2026 Brazilian presidential election?`),
+    );
+    normalizeRelatedMarkets(markets);
+
+    const sum = markets.reduce((a, k) => a + k.aiEstimate.yesProbability, 0);
+    expect(sum).toBeCloseTo(1.0, 6);
+
+    const zema = markets[0]!.aiEstimate.yesProbability;
+    // Anchored: well below the proportional result of 0.75 / 1.771 = 0.423.
+    expect(zema).toBeLessThan(0.2);
+    // And not driven to the floor either — it is a cut, not a clamp.
+    expect(zema).toBeGreaterThan(0.001);
+
+    // Lula sits near its venue price and must keep roughly its own number
+    // rather than absorbing someone else's error.
+    expect(markets[3]!.aiEstimate.yesProbability).toBeGreaterThan(0.4);
+  });
+
+  it("never leaves a member below the floor", () => {
     const markets = [
-      m("x1", 0.9, 0.9, "Will candidate A win the 2028 mayoral election?"),
-      m("x2", 0.7, 0.7, "Will candidate B win the 2028 mayoral election?"),
-      m("x3", 0.1, 0.85, "Will candidate C win the 2028 mayoral election?"),
+      m("x1", 0.9, 0.9, "Will candidate-a-example win the 2028 mayoral election?"),
+      m("x2", 0.7, 0.7, "Will candidate-b-example win the 2028 mayoral election?"),
+      m("x3", 0.1, 0.85, "Will candidate-c-example win the 2028 mayoral election?"),
     ];
     normalizeRelatedMarkets(markets);
 
     const sum = markets.reduce((a, k) => a + k.aiEstimate.yesProbability, 0);
-    expect(sum).toBeCloseTo(1.0, 9);
-    // Proportional preserves relative shape; nothing lands on a clamp.
-    expect(markets[2]!.aiEstimate.yesProbability).toBeCloseTo(0.1 / 1.7, 9);
+    expect(sum).toBeCloseTo(1.0, 6);
     for (const k of markets) {
-      expect(k.aiEstimate.yesProbability).toBeGreaterThan(0.001);
+      expect(k.aiEstimate.yesProbability).toBeGreaterThanOrEqual(0.001);
+      expect(Number.isFinite(k.aiEstimate.yesProbability)).toBe(true);
     }
   });
 });

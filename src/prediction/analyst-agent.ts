@@ -116,6 +116,11 @@ export interface AlphaCandidate {
   diffPp: number;
   direction: "ai_higher" | "ai_lower";
   venue: string;
+  /** When the market closes. Carried into the prompt because urgency is a
+   *  question about time remaining, and the candidate list used to omit it —
+   *  leaving the model to rate urgency off the size of the disagreement, which
+   *  is how five markets closing months apart all came back with one label. */
+  closesAt?: Date;
 }
 
 /**
@@ -176,6 +181,9 @@ export function findAlphaCandidates(
         diffPp,
         direction: diffPp > 0 ? "ai_higher" : "ai_lower",
         venue: quote.venue,
+        ...(m.expiresAt instanceof Date && !Number.isNaN(m.expiresAt.getTime())
+          ? { closesAt: m.expiresAt }
+          : {}),
       });
     }
   }
@@ -250,8 +258,13 @@ WRITE FOR AN ORDINARY READER, NOT A TRADER:
   "basis points", "arbitrage", "orderbook", "mispricing", "conviction", "signal".
 - Say "we think" / "the market thinks", never "our AI estimates" or "AI projects".
   The reader knows a program wrote this; repeating it in every line adds nothing.
-- Explain WHY it matters in one short clause a non-expert would follow, e.g.
-  "we think this is far likelier than the market does — worth a look".
+- Explain WHY it matters in one short clause a non-expert would follow, and make
+  that clause specific to THIS market — what would have to happen, what the
+  disagreement rests on, what closes soon. Do NOT end every entry with the same
+  stock phrase: on 2026-09-10 all five opportunities closed with the identical
+  words "worth a look", which reads as a template rather than an assessment. If
+  two entries could swap their closing clauses without anyone noticing, neither
+  clause is saying anything.
 - Percentages are fine. Say "25 percentage points", not "25pp". Write "0.25%
   interest rate change" rather than "25bps".
 - Short sentences. If a sentence needs a finance dictionary, rewrite it.
@@ -266,6 +279,14 @@ CRITICAL RULES:
    An "Alpha Opportunity" is STRICTLY a trading disagreement between our AI estimate and the LIVE ORDERBOOK venue price on a prediction market (|AI - Venue| >= 10pp).
    - NEVER include single-sided news, Telegram messages, unlisted events, or internal high-conviction forecasts without a live venue price as Alpha.
    - You may ONLY generate "alphaOpportunities" from the "Verified Tradeable Alpha Divergences" provided below. If none are listed, you MUST return "alphaOpportunities": [].
+   - "urgency" is about TIME, not about how big the disagreement is. Judge it from
+     the market's "closes" date against today: "high" only when it closes within
+     about a week, "medium" within about a month, "low" beyond that. A 60-point
+     disagreement on a market closing next year is still "low" — there is no hurry.
+   - Judge each entry's urgency on its own closing date. A whole list sharing one
+     urgency is only correct when the markets genuinely share a horizon; if they
+     close months apart and you gave them all the same label, you rated the size
+     of the gap instead of the time remaining.
 
 2. POLITICAL BASE RATE & ELECTIONS RULE:
    - For distant multi-candidate elections (>6 months away), non-incumbent challengers have a low base rate (<35%).
@@ -298,10 +319,18 @@ ${
   alphaCandidates.length
     ? `Verified Tradeable Alpha Divergences (|AI - Live Venue Orderbook| >= 10pp):\n${alphaCandidates
         .slice(0, 5)
-        .map(
-          (c) =>
-            `- ${c.title} — AI ${formatPercent(c.aiProbability)} vs ${c.venue} ${formatPercent(c.crowdProbability)} (${c.diffPp > 0 ? "+" : ""}${c.diffPp.toFixed(1)}pp diff)`,
-        )
+        .map((c) => {
+          // Days-to-close is spelled out, not left as a date to subtract:
+          // urgency is a judgement about time remaining and the model should
+          // not have to do arithmetic to make it.
+          const closes = c.closesAt
+            ? `, closes ${c.closesAt.toISOString().slice(0, 10)} (${Math.max(
+                0,
+                Math.round((c.closesAt.getTime() - now.getTime()) / 86400000),
+              )} days)`
+            : "";
+          return `- ${c.title} — AI ${formatPercent(c.aiProbability)} vs ${c.venue} ${formatPercent(c.crowdProbability)} (${c.diffPp > 0 ? "+" : ""}${c.diffPp.toFixed(1)}pp diff)${closes}`;
+        })
         .join("\n")}\n`
     : "Verified Tradeable Alpha Divergences: None currently detected (no live orderbook divergences >= 10pp).\n\n"
 }${

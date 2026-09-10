@@ -212,21 +212,18 @@ export function anchorWeightedNormalize(
   // 79.5%, and the 0.1% was the clamp, not a view. Clamping silently is what
   // made a grouping bug read as a confident contrarian call.
   //
-  // So detect the overshoot instead of hiding it, and fall back to proportional
-  // normalization, which cannot go negative: every estimate keeps its share of
-  // the total. The group is still forced to 1.0 — the caller decided these
-  // outcomes are exclusive — but no member is invented.
-  const overshoots = rawProbs.some(
-    (p, i) => p - excess * (distances[i]! / totalDistance) < MIN_ANCHORED_PROBABILITY,
-  );
-  if (overshoots) {
-    return rawProbs.map((p) => p / sum);
-  }
-
-  const result = rawProbs.map((p, i) => {
-    const cut = excess * (distances[i]! / totalDistance);
-    return p - cut;
-  });
+  // Falling back to plain proportional is not the answer either. Proportional
+  // divides everyone by the same factor, which is exactly the behaviour anchor
+  // weighting exists to avoid: on the nine-candidate 2026 Brazilian field, whose
+  // raws sum to 177%, proportional lifts a 75% estimate priced at 0.5% by the
+  // venue to 42% — further from the market than the 12% the anchored method
+  // reaches, and published as a headline disagreement.
+  //
+  // So exhaust the cut instead. Repeatedly charge the excess by distance among
+  // the members that can still absorb it, park anyone driven to the floor, and
+  // redistribute what they could not take. Distance still decides who pays, and
+  // nobody goes negative.
+  const result = distributeExcessByDistance(rawProbs, distances, excess);
 
   // The cuts sum to `excess` by construction, so this should already be 1.0.
   // Kept as a guard against floating-point residue only; it no longer repairs a
@@ -235,6 +232,68 @@ export function anchorWeightedNormalize(
   if (Math.abs(resultSum - 1.0) > 0.001) {
     return result.map((p) => p / resultSum);
   }
+  return result;
+}
+
+/**
+ * Charge `excess` against `values` in proportion to `distances`, without letting
+ * any member fall below the floor.
+ *
+ * A single-pass distance-weighted cut can hand a member more excess than it
+ * holds. Rather than clamping (which invents a number) or abandoning the method
+ * (which loses the anchoring), this settles the same charge iteratively: members
+ * that hit the floor are frozen there, and their unpaid share is re-charged to
+ * the rest by the same distance rule. Terminates because each round freezes at
+ * least one member, and falls back to proportional only if every member freezes
+ * — the degenerate case where the group has no capacity to absorb anything.
+ */
+function distributeExcessByDistance(
+  values: number[],
+  distances: number[],
+  excess: number,
+): number[] {
+  const result = [...values];
+  const frozen = new Array<boolean>(values.length).fill(false);
+  let remaining = excess;
+
+  for (let round = 0; round < values.length && remaining > 1e-12; round++) {
+    let activeDistance = 0;
+    for (let i = 0; i < values.length; i++) {
+      if (!frozen[i]) activeDistance += distances[i]!;
+    }
+    // No active member has any distance left to charge against — spread the
+    // remainder evenly over whoever can still pay.
+    if (activeDistance < 1e-12) {
+      const active = result.filter((_, i) => !frozen[i]).length;
+      if (active === 0) break;
+      const share = remaining / active;
+      for (let i = 0; i < result.length; i++) {
+        if (!frozen[i]) result[i] = Math.max(MIN_ANCHORED_PROBABILITY, result[i]! - share);
+      }
+      break;
+    }
+
+    let charged = 0;
+    let froze = false;
+    for (let i = 0; i < result.length; i++) {
+      if (frozen[i]) continue;
+      const cut = remaining * (distances[i]! / activeDistance);
+      const room = result[i]! - MIN_ANCHORED_PROBABILITY;
+      if (cut >= room) {
+        charged += room;
+        result[i] = MIN_ANCHORED_PROBABILITY;
+        frozen[i] = true;
+        froze = true;
+      } else {
+        charged += cut;
+        result[i] = result[i]! - cut;
+      }
+    }
+    remaining -= charged;
+    // Nothing froze and nothing is left: the charge settled cleanly.
+    if (!froze) break;
+  }
+
   return result;
 }
 

@@ -10,7 +10,8 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { normaliseAlpha } from "../../src/prediction/analyst-agent.ts";
+import { normaliseAlpha, findAlphaCandidates } from "../../src/prediction/analyst-agent.ts";
+import type { PredictionMarket } from "../../src/prediction/types.ts";
 
 describe("normaliseAlpha urgency", () => {
   test("keeps an urgency the model actually stated", () => {
@@ -50,5 +51,63 @@ describe("normaliseAlpha urgency", () => {
       Array.from({ length: 5 }, (_, i) => ({ title: `M${i}`, reasoning: "r" })),
     );
     expect(out.every((o) => o.urgencyUnstated === true)).toBe(true);
+  });
+});
+
+describe("alpha candidates carry a closing date", () => {
+  const NOW = new Date("2026-09-10T11:00:00Z");
+
+  function market(id: string, ai: number, venue: number, expiresAt: string): PredictionMarket {
+    return {
+      id,
+      title: `${id} question?`,
+      description: "",
+      category: "finance",
+      status: "active",
+      createdAt: new Date("2026-09-01"),
+      expiresAt: new Date(expiresAt),
+      aiEstimate: {
+        yesProbability: ai,
+        confidence: 0.7,
+        reasoning: "",
+        sources: [],
+        modelVersion: "test",
+        updatedAt: NOW,
+      },
+      qualityScore: {
+        overall: 80,
+        verifiability: 80,
+        historicalSimilarity: 80,
+        communityPotential: 80,
+        liquidityPotential: 80,
+        timelineFeasibility: 80,
+        reasoning: "",
+        historicalCases: [],
+        risks: [],
+      },
+      sourceSignals: [],
+      relatedMarkets: [],
+      metadata: {
+        crowdQuote: {
+          probability: venue,
+          basis: "orderbook_mid",
+          venue: "polymarket",
+          asOf: NOW.toISOString(),
+        },
+      },
+    };
+  }
+
+  test("closesAt reaches the candidate, so urgency can be judged on time", () => {
+    // Without this the prompt showed only the size of the disagreement, and a
+    // market closing next year looked exactly like one closing next week.
+    const soon = market("soon", 0.2, 0.8, "2026-09-15T00:00:00Z");
+    const distant = market("distant", 0.2, 0.8, "2026-12-31T00:00:00Z");
+    const out = findAlphaCandidates([soon, distant], { now: NOW });
+
+    expect(out).toHaveLength(2);
+    const byId = new Map(out.map((c) => [c.marketId, c]));
+    expect(byId.get("soon")!.closesAt?.toISOString().slice(0, 10)).toBe("2026-09-15");
+    expect(byId.get("distant")!.closesAt?.toISOString().slice(0, 10)).toBe("2026-12-31");
   });
 });
