@@ -47,7 +47,10 @@ import { extractCrowdQuote } from "../src/prediction/crowd.ts";
 import { isLive } from "../src/prediction/deadline.ts";
 import { findStructuralDesyncs, relatedMarketIds } from "../src/prediction/cross-market.ts";
 import { normalizeRelatedMarkets, extractContestKey } from "../src/prediction/normalize.ts";
-import { enforceMonotonicity } from "../src/prediction/monotonic.ts";
+import {
+  enforceMonotonicity,
+  enforceThresholdMonotonicity,
+} from "../src/prediction/monotonic.ts";
 import { sweepUnsettleable } from "../src/prediction/unsettleable.ts";
 import type { PredictionSignal, PredictionMarket, SignalSource } from "../src/prediction/types.ts";
 import { formatReportMarkdown } from "./lib/report-format.ts";
@@ -600,6 +603,21 @@ async function main(): Promise<void> {
       console.log(
         `    ${(a.before * 100).toFixed(1)}% -> ${(a.after * 100).toFixed(1)}% ` +
           `by ${a.deadline.toISOString().slice(0, 10)}  ${a.title.slice(0, 54)}`,
+      );
+    }
+  }
+
+  // Threshold ladders are monotonic in magnitude rather than in time, and are
+  // excluded from the sum-to-one pass above because their outcomes nest instead
+  // of excluding each other. This is the ordering check that does bind them.
+  const thresholdResult = enforceThresholdMonotonicity(liveMarkets, { now });
+  if (thresholdResult.seriesCount > 0) {
+    console.log(
+      `[run-prediction-cycle] threshold monotonicity: repaired ${thresholdResult.adjustments.length} estimate(s) across ${thresholdResult.seriesCount} ladder(s)`,
+    );
+    for (const a of thresholdResult.adjustments) {
+      console.log(
+        `    ${(a.before * 100).toFixed(1)}% -> ${(a.after * 100).toFixed(1)}%  ${a.title.slice(0, 60)}`,
       );
     }
   }
