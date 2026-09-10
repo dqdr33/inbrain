@@ -40,20 +40,21 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { SignalAgent } from "../src/prediction/signal-agent.ts";
-import { BrainAgent } from "../src/prediction/brain-agent.ts";
+import { BrainAgent, type ContestContext } from "../src/prediction/brain-agent.ts";
 import { AnalystAgent, maxEstimateAgeFor } from "../src/prediction/analyst-agent.ts";
 import { ExecutionAgent } from "../src/prediction/execution-agent.ts";
 import { extractCrowdQuote } from "../src/prediction/crowd.ts";
 import { isLive } from "../src/prediction/deadline.ts";
 import { findStructuralDesyncs, relatedMarketIds } from "../src/prediction/cross-market.ts";
-import { normalizeRelatedMarkets } from "../src/prediction/normalize.ts";
+import { normalizeRelatedMarkets, extractContestKey } from "../src/prediction/normalize.ts";
 import { enforceMonotonicity } from "../src/prediction/monotonic.ts";
+import { sweepUnsettleable } from "../src/prediction/unsettleable.ts";
 import type { PredictionSignal, PredictionMarket, SignalSource } from "../src/prediction/types.ts";
 import { formatReportMarkdown } from "./lib/report-format.ts";
 import { refreshQuotes } from "./lib/quote-refresh.ts";
 import { fetchVenueResolution as fetchVenueOutcome } from "./lib/venue-settle.ts";
 import { loadKeyPool, FREE_TIER_DAILY_REQUESTS } from "./lib/gemini-keys.ts";
-import { createLlmCall, formatUsage, DEFAULT_GEMINI_MODEL } from "./lib/llm.ts";
+import { createLlmCall, formatUsage, DEFAULT_GEMINI_MODEL, stripFences } from "./lib/llm.ts";
 import { brainGet, brainQuery, brainWrite as brainWriteRaw } from "./lib/brain-cli.ts";
 import { loadCalibrationFit } from "./lib/calibration-store.ts";
 import { sendTelegram } from "./lib/telegram.ts";
@@ -127,6 +128,10 @@ const DEFAULT_SOURCES = [
   "alphavantage",
   "dune",
   "farcaster",
+  "covalent",
+  "cmc",
+  "token_unlocks",
+  "lunarcrush",
 ].join(",");
 
 const SOURCES = (flag("sources", DEFAULT_SOURCES) ?? DEFAULT_SOURCES)
@@ -146,6 +151,7 @@ const KNOWN_SOURCES: ReadonlySet<string> = new Set<SignalSource>([
   "x_twitter", "news", "onchain", "polymarket", "kalshi", "predictit", "reddit",
   "discord", "manual", "defillama", "rss", "binance", "bybit", "coingecko",
   "gdelt", "telegram", "fred", "alphavantage", "dune", "farcaster",
+  "covalent", "cmc", "token_unlocks", "lunarcrush"
 ]);
 const unknownSources = SOURCES.filter((s) => !KNOWN_SOURCES.has(s));
 if (unknownSources.length > 0) {
@@ -240,7 +246,7 @@ const REPORT_DIR = join(REPO_ROOT, "Report");
 
 async function translateToRussian(englishMd: string): Promise<string> {
   try {
-    return await llmCall(
+    const raw = await llmCall(
       "Переведи этот отчёт с английского на русский, сохранив разметку Markdown " +
         "(заголовки, списки, жирный шрифт, frontmatter). Числа, проценты,slug'и и " +
         "ключи YAML оставь как есть. Части, уже написанные по-русски, не трогай.\n\n" +
@@ -252,11 +258,64 @@ async function translateToRussian(englishMd: string): Promise<string> {
         "Короткие фразы. Если фразу нельзя понять без финансового словаря — " +
         "перепиши её проще.",
       englishMd,
+      {
+        // Translation is mechanical — there is nothing to deliberate about, and
+        // on gemini-2.5-flash the thinking budget is drawn from the same
+        // allowance as the answer. Disabling it is what stops the model from
+        // running out mid-document and returning just the frontmatter.
+        thinkingBudget: 0,
+        // Headroom for the whole report: Russian runs longer than English, and
+        // one token is well under one character here (Cyrillic costs more
+        // tokens per character than Latin), so scale generously off the input.
+        maxOutputTokens: Math.min(32_000, Math.max(4_000, englishMd.length)),
+      },
     );
+    const translated = stripFences(raw);
+
+    // A truncated translation is worse than none. Gemini 2.5-flash is a
+    // thinking model: when reasoning eats the output budget it can return
+    // finishReason=STOP having emitted only the YAML frontmatter — 109 chars
+    // for a 3.3KB report. That stub is still truthy, so `ruTranslation ||
+    // reportMd` happily published it and the Telegram channel got a message
+    // consisting of `type: prediction-daily-report` and nothing else
+    // (2026-09-10 10:43, and 2026-09-09 10:40 before it).
+    //
+    // Judge it by body length after the frontmatter, not total length: the
+    // frontmatter is copied through verbatim and is the exact part that
+    // survives a truncation.
+    if (!isCompleteTranslation(translated, englishMd)) {
+      console.error(
+        `[report-file] translation came back truncated (${translated.length} chars for a ` +
+          `${englishMd.length}-char report) — discarding, English original will be used`,
+      );
+      return "";
+    }
+    return translated;
   } catch (err) {
     console.error("[report-file] translation failed (non-fatal):", (err as Error).message.slice(0, 200));
     return "";
   }
+}
+
+/** Strip a leading `---`-delimited YAML frontmatter block, if present. */
+function stripFrontmatter(md: string): string {
+  const m = md.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+  return m ? md.slice(m[0].length) : md;
+}
+
+/**
+ * Does this translation actually cover the report, or is it a truncated stub?
+ *
+ * Requires the body (frontmatter excluded) to reach a third of the original's
+ * body. Russian renders longer than English, so a genuine translation clears
+ * this by a wide margin; the observed failures produced a body of zero.
+ */
+export function isCompleteTranslation(translated: string, englishMd: string): boolean {
+  const ruBody = stripFrontmatter(translated).trim();
+  const enBody = stripFrontmatter(englishMd).trim();
+  if (ruBody.length === 0) return false;
+  if (enBody.length === 0) return true;
+  return ruBody.length >= enBody.length / 3;
 }
 
 async function saveReportFile(reportMd: string, startedAt: Date, ruMd: string): Promise<void> {
@@ -344,7 +403,22 @@ async function main(): Promise<void> {
   let skipped = 0;
   for (const signal of signals) {
     try {
-      const result = await brainAgent.evaluate(signal);
+      let contestContext: ContestContext | undefined;
+      const contestKey = extractContestKey(signal.content);
+      if (contestKey) {
+        const all = [...state.activeMarkets, ...newMarkets];
+        const peers = all.filter(m => (m.metadata?.normalizationGroup ?? extractContestKey(m.title)) === contestKey);
+        contestContext = {
+          groupKey: contestKey,
+          totalCandidates: peers.length + 1,
+          peers: peers.map(p => {
+            const q = p.metadata?.crowdQuote as { probability?: number } | undefined;
+            const price = q?.probability ?? p.metadata?.crowdProbability as number | undefined;
+            return { title: p.title, venuePrice: price };
+          })
+        };
+      }
+      const result = await brainAgent.evaluate(signal, { contestContext });
       if (result.accepted) {
         newMarkets.push(result.market);
       } else {
@@ -493,7 +567,7 @@ async function main(): Promise<void> {
     for (const market of staleMarkets) {
       try {
         const before = market.aiEstimate.yesProbability;
-        const updated = await execution.refreshMarketEstimate(market);
+        const updated = await execution.refreshMarketEstimate(market, liveMarkets);
         if (updated) {
           console.log(
             `    ${(before * 100).toFixed(1)}% -> ${(updated.yesProbability * 100).toFixed(1)}%  ${market.title.slice(0, 48)}`,
@@ -540,10 +614,38 @@ async function main(): Promise<void> {
     if (linked) market.relatedMarkets = [...linked];
   }
 
+  // Cancel what no venue can ever settle, before anything is reported or
+  // saved. Feed posts with no price were accumulating without bound: 172 of
+  // 302 active markets came from telegram, none of them tradeable, and the
+  // two cleanup scripts that addressed this were manual and only looked at
+  // `pending_resolution` — which 79 of those rows were not. Running it here
+  // means the state file converges instead of growing every cycle.
+  const sweep = sweepUnsettleable(stillActive, { now });
+  if (sweep.cancelled.length > 0) {
+    console.log(
+      `[run-prediction-cycle] cancelled ${sweep.cancelled.length} unsettleable market(s)`,
+    );
+  }
+  if (sweep.flaggedForReview.length > 0) {
+    console.log(
+      `[run-prediction-cycle] ${sweep.flaggedForReview.length} expired question(s) need a human answer — kept`,
+    );
+  }
+  const reportable = stillActive.filter((m) => m.status !== "cancelled");
+  const liveReportable = liveMarkets.filter((m) => m.status !== "cancelled");
+
   const analyst = new AnalystAgent({ brainQuery, llmCall });
   // Pass resolved markets too — the report's Brier score is computed from them.
-  const report = await analyst.generateDailyReport([...stillActive, ...state.resolvedMarkets]);
-  const reportMd = formatReportMarkdown(report, stillActive, now);
+  const report = await analyst.generateDailyReport([...reportable, ...state.resolvedMarkets]);
+  // Render from `liveMarkets`, not `stillActive`. The repairs above all ran on
+  // the live set, but the renderer was handed the raw one — 302 rows including
+  // 101 already past their deadline. `formatReportMarkdown` re-filters by
+  // isLive internally, so this was not visibly broken, but passing the
+  // unfiltered list meant the report and the repairs disagreed about what the
+  // day's markets were. `generateDailyReport` above still gets the full set:
+  // it needs the pending backlog for expiredPending and the resolved markets
+  // for the Brier score.
+  const reportMd = formatReportMarkdown(report, liveReportable, now);
 
   console.log("\n" + reportMd + "\n");
 

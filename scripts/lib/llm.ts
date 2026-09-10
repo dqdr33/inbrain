@@ -15,10 +15,10 @@ export function geminiUrl(model: string): string {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 }
 
-/** Pull JSON out of a ```json fence. Returns the text unchanged when unfenced. */
+/** Pull content out of a ``` fence. Returns the text unchanged when unfenced. */
 export function stripFences(text: string): string {
-  const m = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  return m ? m[1] : text;
+  const m = text.match(/```(?:[a-z]+)?\s*([\s\S]*?)\s*```/i);
+  return m ? m[1].trim() : text.trim();
 }
 
 export async function sleep(ms: number): Promise<void> {
@@ -27,6 +27,25 @@ export async function sleep(ms: number): Promise<void> {
 
 export interface LlmCallOptions {
   model?: string;
+  /**
+   * Cap on the response body, passed through as `generationConfig.maxOutputTokens`.
+   *
+   * Worth setting for any call whose output is long-form (a translation of a
+   * whole report). Left unset, the model uses its own default, which on the
+   * 2.5 "thinking" models is shared with the reasoning budget.
+   */
+  maxOutputTokens?: number;
+  /**
+   * `generationConfig.thinkingConfig.thinkingBudget` — reasoning tokens the
+   * model may spend before answering. 0 disables thinking.
+   *
+   * On gemini-2.5-flash, thinking draws from the same budget as the visible
+   * answer, so a long mechanical task (translate this document) can burn the
+   * allowance on deliberation and stop after emitting the frontmatter, with
+   * finishReason=STOP. Setting this to 0 for such calls is what keeps the
+   * whole answer intact.
+   */
+  thinkingBudget?: number;
 }
 
 /** Token counts accumulated across every call made through one LlmCall.
@@ -91,9 +110,21 @@ export function createLlmCall(keyPool: KeyPool, opts: CreateLlmCallOpts = {}): L
   ): Promise<string> {
     const model = callOpts?.model ?? defaultModel;
     const url = geminiUrl(model);
+
+    // Only sent when the caller asked for it, so every existing call site keeps
+    // the exact request shape it had.
+    const generationConfig: Record<string, unknown> = {};
+    if (callOpts?.maxOutputTokens !== undefined) {
+      generationConfig.maxOutputTokens = callOpts.maxOutputTokens;
+    }
+    if (callOpts?.thinkingBudget !== undefined) {
+      generationConfig.thinkingConfig = { thinkingBudget: callOpts.thinkingBudget };
+    }
+
     const body = JSON.stringify({
       systemInstruction: { parts: [{ text: system }] },
       contents: [{ parts: [{ text: prompt }] }],
+      ...(Object.keys(generationConfig).length > 0 ? { generationConfig } : {}),
     });
 
     // Outer loop: cross-key rotation. Inner loop: same-key retry for transient
@@ -158,7 +189,14 @@ export function createLlmCall(keyPool: KeyPool, opts: CreateLlmCallOpts = {}): L
           if (finish && finish !== "STOP") {
             throw new Error(`Gemini stopped early (finishReason=${finish}) — response unusable`);
           }
-          const text = candidate?.content?.parts?.[0]?.text ?? "";
+          // Join every text part rather than reading parts[0]. A thinking model
+          // can put a reasoning part first and the answer in a later one, which
+          // made parts[0] empty and looked like "Gemini returned an empty
+          // completion"; it can also split a long answer across parts, where
+          // taking only the first silently truncates it.
+          const text = (candidate?.content?.parts ?? [])
+            .map((p) => p?.text ?? "")
+            .join("");
           if (!text.trim()) {
             throw new Error("Gemini returned an empty completion");
           }
