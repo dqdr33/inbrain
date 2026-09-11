@@ -34,6 +34,7 @@ import { shrinkTowardPrice } from "./shrink.js";
 import { extractCrowdQuote } from "./crowd.js";
 import { resolveExpiry } from "./deadline.js";
 import { formatPercent } from "./format.js";
+import { extractContestKey } from "./normalize.js";
 
 const DEFAULT_QUALITY_THRESHOLD = 65;
 const DEFAULT_MODEL = "anthropic/claude-sonnet-4-6";
@@ -45,6 +46,19 @@ const EXISTING_MARKET_SOURCES = new Set<PredictionSignal["source"]>([
   "kalshi",
   "predictit",
 ]);
+
+/**
+ * The venue's own price for this signal, when it carries one.
+ *
+ * Used as the fallback for a failed estimate: standing exactly where the market
+ * stands is the one answer that cannot invent a disagreement, which is what a
+ * parse failure must never do.
+ */
+function venuePriceOf(signal: PredictionSignal): number | undefined {
+  const quote = extractCrowdQuote(signal);
+  const p = quote?.probability;
+  return typeof p === "number" && Number.isFinite(p) && p >= 0 && p <= 1 ? p : undefined;
+}
 
 export interface BrainAgentOptions {
   qualityThreshold?: number;
@@ -87,6 +101,17 @@ export interface BrainAgentOptions {
    * and future fits would then train on already-corrected output.
    */
   calibrationFit?: CalibrationFit;
+}
+
+/**
+ * Context about the mutually exclusive contest this signal belongs to.
+ * Passed when the caller knows this candidate is one of N in a group.
+ */
+export interface ContestContext {
+  groupKey: string;
+  totalCandidates: number;
+  /** Other candidates with their venue prices (NOT our AI estimates). */
+  peers: Array<{ title: string; venuePrice: number | undefined }>;
 }
 
 /**
@@ -191,14 +216,30 @@ START FROM THE MARKET PRICE:
  * Returns the rejection reason, or null when the signal is a genuine question.
  */
 export function reportsSettledFact(signal: PredictionSignal): string | null {
-  const text = signal.content ?? "";
-  if (!text.trim()) return "empty signal";
+  const raw = signal.content ?? "";
+  if (!raw.trim()) return "empty signal";
+
+  // Strip the feed's own routing prefix before anything is measured. The
+  // ingest wrapper stamps "Telegram Insider [channelname]: " onto every post
+  // (signal-agent.ts), which is 25-30 characters — a third of the 90-char
+  // window below and half of the 60-char newsflash window. With the prefix
+  // in place, "Telegram Insider [bitcoin]: JUST IN: ..." could push its own
+  // "JUST IN" past the newsflash check and be admitted as a forecast.
+  const text = raw.replace(/^\s*Telegram Insider\s*\[[^\]]*\]:\s*/i, "");
 
   // A real question. Venue markets always take this shape, and a headline that
   // genuinely asks about the future keeps its chance here.
+  //
+  // Bare `is`/`are`/`does` are NOT evidence of a question — they are the most
+  // common verbs in English, so the old predicate admitted any declarative
+  // sentence containing one. A Fidelity quote ("BTC volatility IS now lower
+  // than 98.5% of all days") and a Bybit promo ("Trade selected pairs...")
+  // both cleared it; 52 of the 172 Telegram rows in production entered this
+  // way. A question needs an actual question mark or an explicit future
+  // construction; a deadline or a fixture is handled separately below.
   const isQuestion =
     /\?/.test(text) ||
-    /\b(will|would|can|does|is|are|by \d{4}|before|through|until)\b/i.test(text.slice(0, 90));
+    /\b(will|would|shall|going to|expected to)\b/i.test(text.slice(0, 90));
 
   // Newswire framing: the flash markers these feeds prefix onto announcements.
   const isNewsFlash = /\b(just in|breaking|update|announced|confirms?|reports?)\b/i.test(
@@ -224,6 +265,31 @@ export function reportsSettledFact(signal: PredictionSignal): string | null {
   // venue settles it.
   const isFixture = /\bvs\.?\b/i.test(text);
 
+  // Operational notices from exchange/newswire channels: "Binance Will Support
+  // the KITE Contract Swap", "Notice of Removal of Spot Trading Pairs",
+  // "Peter Schiff says …". These state a decision already taken or an opinion
+  // held — the company is telling you what it is going to do, not asking
+  // whether it will.
+  //
+  // Checked BEFORE the acceptance branch, because these carry "will" as a
+  // matter of corporate register and would otherwise read as future-tense
+  // forecasts. 61 of the 172 Telegram rows in production survived the
+  // tightened question predicate on exactly this shape.
+  //
+  // Two things still outrank it, both load-bearing: an explicit question mark
+  // ("Will Binance delist X by September?" is a real market), and a stated
+  // deadline. The deadline carve-out is why "US announces end of Iranian
+  // blockade by August 31, 2026" survives — "announces" matches the notice
+  // pattern, but the date makes it forecastable and it is a genuine venue
+  // market. Dropping either exemption breaks settled-fact.test.ts.
+  const isOperationalNotice =
+    /\b(notice of|will (support|cease|add|remove|delist|extend|adjust|suspend|open|close|stop|discuss|conduct|complete|update|launch)|adds?|removes?|delists?|launches|introduc\w+|says|said|announces?)\b/i.test(
+      text,
+    );
+  if (isOperationalNotice && !/\?/.test(text) && !hasDeadline) {
+    return "an announcement or opinion, not a question with a future outcome";
+  }
+
   if (isQuestion || hasDeadline || isFixture) {
     // Still reject a fixture reported as a finished result ("Reds beat Sox 4-2").
     if (isFixture && /\b(beat|defeated|won|lost|wins|loses|final score)\b/i.test(text)) {
@@ -234,18 +300,6 @@ export function reportsSettledFact(signal: PredictionSignal): string | null {
 
   if (isNewsFlash) return "reports an event that already happened, not a question about the future";
   if (isPastEvent) return "describes a completed event, so there is no outcome left to forecast";
-
-  // Operational notices from exchange/newswire channels: "Binance Adds 0G on
-  // Spot", "Notice of Removal of Spot Trading Pairs", "Peter Schiff says …".
-  // These state a decision or an opinion, never pose a question, and are the
-  // rest of the 88 telegram pseudo-markets that piled up in pending_resolution.
-  const isOperationalNotice =
-    /\b(notice of|will (add|remove|delist|extend|adjust|suspend|open|close)|adds?|removes?|delists?|launches|introduc\w+|says|said|announces?)\b/i.test(
-      text,
-    );
-  if (isOperationalNotice) {
-    return "an announcement or opinion, not a question with a future outcome";
-  }
 
   // The catch-all, and the one that does most of the work. A forecastable market
   // needs a resolvable outcome. A headline like "Solana RWA Ecosystem: Third in
@@ -334,6 +388,7 @@ export class BrainAgent {
 
   async evaluate(
     signal: PredictionSignal,
+    opts?: { contestContext?: ContestContext },
   ): Promise<
     | { accepted: true; market: PredictionMarket }
     | { accepted: false; reason: string }
@@ -377,6 +432,7 @@ export class BrainAgent {
       signal,
       historicalContext,
       crowdWisdom,
+      opts?.contestContext,
     );
 
     const market = this.buildMarket(signal, qualityScore, estimate);
@@ -556,6 +612,7 @@ Evaluate this signal for prediction market creation. Consider:
     signal: PredictionSignal,
     historicalContext: string,
     crowdWisdom: CrowdWisdom[],
+    contestContext?: ContestContext,
   ): Promise<AIEstimate> {
     const calibrationContext = await this.calibrationRules();
 
@@ -614,9 +671,29 @@ base rates for this class of event, not in a bare intuition.`;
 Reason about THAT window, not a longer one. Do not infer the date from anything below.`
         : `TODAY IS ${now.toISOString().slice(0, 10)}. Do not infer the current date from anything below.`;
 
+    const contestBlock = contestContext
+      ? (() => {
+          const peerLines = contestContext.peers
+            .map((p) => {
+              const price = p.venuePrice !== undefined
+                ? `${(p.venuePrice * 100).toFixed(1)}%`
+                : "no price";
+              return `  - ${p.title.slice(0, 80)}: ${price}`;
+            })
+            .join("\n");
+          const marketSum = contestContext.peers
+            .filter((p) => p.venuePrice !== undefined)
+            .reduce((s, p) => s + p.venuePrice!, 0);
+          const remaining = Math.max(0, 1 - marketSum);
+          return `\nMUTUALLY EXCLUSIVE CONTEST:\nThis question is ONE outcome out of ${contestContext.totalCandidates} in the group "${contestContext.groupKey.replace(/^contest:/, "").replace(/_/g, " ")}".
+Exactly one can resolve YES; the rest resolve NO.\n\nOther candidates and their current venue prices:\n${peerLines}\nAlready accounted for by the market: ~${(marketSum * 100).toFixed(0)}%. Remaining capacity: ~${(remaining * 100).toFixed(1)}%.\n\nYour estimate MUST be defensible alongside these numbers. If the market allocates very little to this candidate, you need specific evidence the market is missing to assign significantly more.`;
+        })()
+      : "";
+
     const prompt = `Signal: ${signal.content}
 
 ${horizonBlock}
+${contestBlock}
 
 ${anchorBlock}
 
@@ -641,16 +718,24 @@ Estimate the probability that this event resolves YES.`;
         365,
       );
 
-      // Deterministic Base Rate Protection for distant multi-candidate political races:
-      const isDistantContest =
-        /presidential election|presidential nomination|parliamentary election|election|nominee/i.test(
-          signal.content,
-        ) && estDays > 180;
+      // Deterministic Base Rate Protection for multi-candidate political races.
+      // Uses extractContestKey rather than estDays, because the ceiling must hold
+      // even as the election approaches — a non-incumbent does not become the
+      // favourite simply because the calendar advances.
+      const contestKey = extractContestKey(signal.content);
+      const isMultiCandidateContest = contestKey !== undefined;
       const isIncumbent = /incumbent|re-election/i.test(signal.content);
-      const politicalCeiling = isDistantContest && !isIncumbent ? 0.35 : 1;
+      const politicalCeiling = (() => {
+        if (!isMultiCandidateContest || isIncumbent) return 1;
+        // If we don't have contest context, assume a crowded field and cap at 0.35.
+        // If we do know N, allow up to max(0.35, 2/N).
+        if (!contestContext || contestContext.totalCandidates < 2) return 0.35;
+        const peerCount = contestContext.totalCandidates;
+        return Math.max(0.35, 2 / peerCount);
+      })();
       if (yesProbability > politicalCeiling) {
         console.warn(
-          `[brain-agent] ${context}: political base rate clamp (${(yesProbability * 100).toFixed(1)}% > 35% for distant multi-candidate race) — clamped to 0.35`,
+          `[brain-agent] ${context}: contest ceiling clamp (${(yesProbability * 100).toFixed(1)}% > ${(politicalCeiling * 100).toFixed(1)}% for multi-candidate race with ${contestContext?.totalCandidates ?? "?"} candidates) — clamped`,
         );
         yesProbability = politicalCeiling;
       }
@@ -692,10 +777,28 @@ Estimate the probability that this event resolves YES.`;
       };
     } catch (err) {
       logValidationFailure(context, err);
+      // A failed parse is not a 50/50 view, and calling it a "base rate" made it
+      // read like one. 0.5 is the worst possible stand-in: it is maximally far
+      // from the near-zero price of exactly the long-shot questions whose
+      // answers fail to parse, so it manufactures a ~50-point disagreement out
+      // of a JSON error. One such row reached the 2026-09-11 report as an
+      // opportunity, and the analyst model — having no way to know the number
+      // was wreckage — invented a political rationale for it.
+      //
+      // Fall back to the venue price when there is one: it is the best available
+      // estimate and yields a disagreement of zero, so a parse failure can never
+      // surface as alpha. With no price, mark it unestimated rather than
+      // guessing; downstream filters drop it.
+      const fallback = venuePriceOf(signal);
       return {
-        yesProbability: 0.5,
-        confidence: 0.1,
-        reasoning: `Unable to generate estimate (${(err as Error).message}) — using base rate`,
+        yesProbability: fallback ?? 0.5,
+        confidence: 0,
+        estimateFailed: true,
+        reasoning:
+          `Unable to generate estimate (${(err as Error).message}) — ` +
+          (fallback !== undefined
+            ? `falling back to the venue price of ${(fallback * 100).toFixed(2)}%. This is NOT a forecast.`
+            : `no venue price to fall back on. This is NOT a forecast.`),
         sources: [],
         estimatedResolutionDays: 30,
         modelVersion: this.modelId,

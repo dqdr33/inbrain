@@ -143,12 +143,29 @@ describe("estimate validation", () => {
     expect(result.market.metadata.expirySource).toBe("llm");
   });
 
-  test("falls back to the base rate when the estimate is unusable", async () => {
+  test("marks an unusable estimate as failed and stands on the venue price", async () => {
+    // 0.5 was the old stand-in and the worst available one: it sits ~50 points
+    // from the near-zero price of the long-shot questions whose answers tend to
+    // fail, so a JSON error surfaced as the day's largest disagreement.
     const { agent } = agentWith([GOOD_QUALITY, "no idea"]);
     const result = await agent.evaluate(signal());
     if (!result.accepted) throw new Error("expected acceptance");
-    expect(result.market.aiEstimate.yesProbability).toBe(0.5);
-    expect(result.market.aiEstimate.confidence).toBe(0.1);
+    expect(result.market.aiEstimate.estimateFailed).toBe(true);
+    expect(result.market.aiEstimate.confidence).toBe(0);
+    // The signal carries a venue price; standing on it makes the disagreement
+    // zero, so a parse failure cannot be screened as alpha.
+    expect(result.market.aiEstimate.yesProbability).toBe(
+      result.market.metadata.crowdProbability as number,
+    );
+  });
+
+  test("an unusable estimate with no venue price is still marked failed", async () => {
+    const { agent } = agentWith([GOOD_QUALITY, "no idea"]);
+    const noPrice = { ...signal(), rawData: {} };
+    const result = await agent.evaluate(noPrice);
+    if (!result.accepted) throw new Error("expected acceptance");
+    expect(result.market.aiEstimate.estimateFailed).toBe(true);
+    expect(result.market.aiEstimate.confidence).toBe(0);
   });
 
   test("never stores an undefined probability", async () => {
@@ -364,10 +381,11 @@ describe("calibration is applied to the live estimate", () => {
     expect(result.market.aiEstimate.rawYesProbability).toBe(0.32);
   });
 
-  test("the parse-failure fallback stays exactly 0.5 at confidence 0.1", async () => {
-    // The backtest and the learning set both detect this fallback by its exact
-    // signature. Calibrating it would make every historical parse failure
-    // invisible and re-admit it as a genuine mid-range forecast.
+  test("the parse-failure fallback is never run through calibration", async () => {
+    // Calibrating a placeholder would launder it into something that looks like
+    // a real forecast. The fallback used to be recognised by its exact 0.5/0.1
+    // signature; it now carries estimateFailed and confidence 0, which survives
+    // the fallback standing on a venue price instead of a fixed number.
     let i = 0;
     const responses = [GOOD_QUALITY, "I cannot answer in JSON."];
     const agent = new BrainAgent({
@@ -379,8 +397,13 @@ describe("calibration is applied to the live estimate", () => {
 
     const result = await agent.evaluate(signal());
     if (!result.accepted) throw new Error("expected acceptance");
-    expect(result.market.aiEstimate.yesProbability).toBe(0.5);
-    expect(result.market.aiEstimate.confidence).toBe(0.1);
+    const est = result.market.aiEstimate;
+    expect(est.estimateFailed).toBe(true);
+    expect(est.confidence).toBe(0);
+    // Untouched by the non-identity fit: no calibration block, and the value is
+    // the venue price exactly as read.
+    expect(est.calibration).toBeUndefined();
+    expect(est.yesProbability).toBe(result.market.metadata.crowdProbability as number);
   });
 
   test("the political clamp still caps a distant race under an active fit", async () => {
@@ -402,7 +425,7 @@ describe("calibration is applied to the live estimate", () => {
       calibrationFit: { ...IDENTITY_FIT, method: "platt", a: 1.5, b: 1, n: 500, shrink: 1 },
     });
 
-    const s = { ...signal("Who wins the 2028 presidential election?"), rawData: {} };
+    const s = { ...signal("Will Jane Doe win the 2028 presidential election?"), rawData: {} };
     const result = await agent.evaluate(s);
     if (!result.accepted) throw new Error("expected acceptance");
     expect(result.market.aiEstimate.rawYesProbability).toBe(0.35);
@@ -430,9 +453,16 @@ describe("category inference", () => {
 
   // Substring matching sent nearly everything to "technology": "ai" matches
   // inside said/chain/raise/available, "sec" inside second/sector.
+  //
+  // Phrased as a question on purpose. The same substring traps are present, but
+  // "The chain said it will be available…" is an announcement, which
+  // reportsSettledFact now rejects before category inference is ever reached —
+  // and this test is about the classifier, not the intake filter.
   test("does not classify on substrings inside unrelated words", async () => {
     const { agent } = agentWith([GOOD_QUALITY, GOOD_ESTIMATE]);
-    const result = await agent.evaluate(signal("The chain said it will be available in the second half"));
+    const result = await agent.evaluate(
+      signal("Will the chain be available in the second half, as they said?"),
+    );
     if (!result.accepted) throw new Error("expected acceptance");
     expect(result.market.category).toBe("other");
   });

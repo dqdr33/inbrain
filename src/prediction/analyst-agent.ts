@@ -9,6 +9,7 @@ import type {
   PredictionMarket,
   TrendInsight,
   MarketCategory,
+  AIEstimate,
 } from "./types.js";
 import {
   parseLlmJson,
@@ -108,6 +109,21 @@ export function maxEstimateAgeFor(category: string | undefined): number {
   return CATEGORY_MAX_ESTIMATE_AGE_SECONDS[category ?? ""] ?? MAX_ESTIMATE_AGE_SECONDS;
 }
 
+/** The pre-`estimateFailed` shape of a parse failure: 0.5 at confidence <= 0.1,
+ *  with the catch block's own wording in the reasoning. All three conditions are
+ *  required — a genuine "coin flip, and I mean it" forecast sits at 0.5 too, and
+ *  must keep reaching the report. */
+export function isLegacyFailedEstimate(est: AIEstimate | undefined): boolean {
+  if (!est) return false;
+  return (
+    est.yesProbability === 0.5 &&
+    typeof est.confidence === "number" &&
+    est.confidence <= 0.1 &&
+    typeof est.reasoning === "string" &&
+    est.reasoning.startsWith("Unable to generate estimate")
+  );
+}
+
 export interface AlphaCandidate {
   marketId: string;
   title: string;
@@ -137,6 +153,23 @@ export function findAlphaCandidates(
 
   for (const m of markets) {
     if (!isLive(m, now)) continue;
+
+    // A failed estimate is not a forecast. The old fallback stored 0.5 with no
+    // marker, and 0.5 sits ~50 points from the near-zero price of exactly the
+    // long-shot questions whose answers fail to parse — so a JSON error
+    // presented as the day's biggest disagreement. One reached the 2026-09-11
+    // report, where the analyst model, unable to tell wreckage from a view,
+    // explained it as the market overlooking a candidate's background.
+    if (m.aiEstimate?.estimateFailed) continue;
+    // Same verdict for anything that never produced a usable belief: zero
+    // confidence means the estimator declined, whatever the number beside it.
+    if (m.aiEstimate?.confidence === 0) continue;
+    // Rows written before `estimateFailed` existed carry only the old 0.5/0.1
+    // signature, and there are live ones in the state right now — they would go
+    // on surfacing until each is re-estimated. The reasoning string is what
+    // makes this exact rather than a guess about a legitimate 50% call.
+    if (isLegacyFailedEstimate(m.aiEstimate)) continue;
+
     const quote = m.metadata?.crowdQuote as CrowdQuote | undefined;
     if (!quote || quote.basis !== "orderbook_mid" || quote.stale) continue;
     const asOf = new Date(quote.asOf);

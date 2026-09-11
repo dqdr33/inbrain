@@ -32,9 +32,14 @@ export const ORACLE_GRADE: ReadonlySet<MarketResolution["resolvedBy"]> = new Set
   "manual",
 ]);
 
-/** The parse-failure answer from `generateEstimate`'s catch block: 0.5 at
- *  confidence 0.1. It is not a forecast, and admitting it would let upstream
- *  breakage read as a mediocre-but-working mid-range prediction. */
+/** The legacy parse-failure answer from `generateEstimate`'s catch block: 0.5 at
+ *  confidence <= 0.1. It is not a forecast, and admitting it would let upstream
+ *  breakage read as a mediocre-but-working mid-range prediction.
+ *
+ *  Kept for rows already in the state and in saved backtest runs. New failures
+ *  carry `estimateFailed` and confidence 0 instead, which is the check that
+ *  matters: the fallback now uses the venue price where one exists, so the
+ *  forecast is no longer reliably 0.5 and cannot be recognised by its value. */
 const FALLBACK_FORECAST = 0.5;
 const FALLBACK_CONFIDENCE_MAX = 0.1;
 
@@ -97,7 +102,13 @@ function marketToRecord(market: PredictionMarket): ForecastRecord | null {
     finite(market.aiEstimate?.yesProbability);
   if (forecast === undefined) return null;
 
+  // An explicitly-marked failure, whatever number sits beside it.
+  if (market.aiEstimate?.estimateFailed) return null;
+
   const confidence = finite(market.aiEstimate?.confidence);
+  // Zero confidence means the estimator declined. Training on it would teach the
+  // calibration fit from a placeholder.
+  if (confidence === 0) return null;
   if (
     forecast === FALLBACK_FORECAST &&
     confidence !== undefined &&

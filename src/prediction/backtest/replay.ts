@@ -183,19 +183,29 @@ export async function replayOne(
   // post-shrink output would feed corrected numbers back into the next fit —
   // the compounding this whole design exists to prevent.
   //
-  // `rawYesProbability` is absent only on the fallback path below, where the
-  // ?? fallback is exactly right.
+  // `rawYesProbability` is absent only on the failure path below, whose value is
+  // discarded anyway — so the ?? fallback is exactly right.
   const rawForecast = est.rawYesProbability ?? est.yesProbability;
 
-  // BrainAgent answers 0.5 at confidence 0.1 when the model's JSON could not be
-  // parsed or validated — a transport failure wearing the shape of a forecast.
-  // Scoring it as a real 50% call would be wrong in both directions: it inflates
-  // the model's Brier on the (usually NO) outcome, and it fabricates a
-  // "maximum divergence from market" that no model actually expressed.
+  // BrainAgent returns a placeholder when the model's JSON could not be parsed
+  // or validated — a transport failure wearing the shape of a forecast. Scoring
+  // it as a real call would be wrong in both directions: it distorts the model's
+  // Brier on the (usually NO) outcome, and it fabricates a divergence from the
+  // market that no model actually expressed.
+  //
+  // Detected by the `estimateFailed` marker, plus zero confidence for any
+  // producer that sets one without the other. The legacy 0.5/<=0.1 signature is
+  // still recognised for saved runs written before the marker existed; it cannot
+  // be the primary check, because the fallback now stands on the venue price and
+  // so is no longer a fixed number — and because a model may honestly answer
+  // 0.5 at real confidence, which must still be scored.
   //
   // Recorded as NaN so `scoreForecasts` drops it and says how many it dropped,
   // rather than silently deleting the row here.
-  const isFallback = rawForecast === 0.5 && est.confidence <= 0.1;
+  const isFallback =
+    est.estimateFailed === true ||
+    est.confidence === 0 ||
+    (rawForecast === 0.5 && est.confidence <= 0.1);
   const forecast = isFallback ? NaN : rawForecast;
 
   return {

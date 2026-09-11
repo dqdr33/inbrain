@@ -45,7 +45,11 @@ export type SignalSource =
   | "fred"
   | "alphavantage"
   | "dune"
-  | "farcaster";
+  | "farcaster"
+  | "covalent"
+  | "cmc"
+  | "token_unlocks"
+  | "lunarcrush";
 
 export interface EngagementMetrics {
   likes: number;
@@ -128,6 +132,18 @@ export interface AIEstimate {
   /** Model's expected horizon to resolution, 1-365 days. Drives expiresAt.
    *  Used to live only on an `as any` cast, so nothing validated its range. */
   estimatedResolutionDays?: number;
+
+  /**
+   * True when no estimate was produced at all — the model's answer failed to
+   * parse or validate — and `yesProbability` is a placeholder, not a forecast.
+   *
+   * Load-bearing: such a row must never be screened for alpha, scored for
+   * calibration, or described in a report. The old fallback wrote 0.5 with no
+   * marker, which is maximally far from the near-zero price of the long-shot
+   * questions whose answers tend to fail, so a JSON error surfaced as a
+   * 50-point disagreement and the analyst model wrote a rationale for it.
+   */
+  estimateFailed?: boolean;
 
   /**
    * The model's own output, before the calibration layer and the price shrink.
